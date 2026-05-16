@@ -249,8 +249,17 @@ def get_audio_duration(audio_path: Path) -> float:
     return float(text)
 
 
+def get_media_duration(media_path: Path) -> float:
+    return get_audio_duration(media_path)
+
+
 def get_chunk_count(audio_path: Path, chunk_seconds: int) -> int:
     duration = get_audio_duration(audio_path)
+    return int(math.ceil(duration / chunk_seconds))
+
+
+def get_media_chunk_count(media_path: Path, chunk_seconds: int) -> int:
+    duration = get_media_duration(media_path)
     return int(math.ceil(duration / chunk_seconds))
 
 
@@ -346,6 +355,68 @@ def split_audio_if_needed(
     return chunks
 
 
+def split_media_to_chunks_if_needed(
+    media_path: Path,
+    work_dir: Path,
+    chunk_seconds: int = 280,
+    chunk_workers: int = 5,
+) -> List[Tuple[int, Path, float]]:
+    """
+    直接从输入视频/音频并行导出 16kHz mono chunk wav，跳过完整中间 wav。
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = get_media_duration(media_path)
+    chunk_count = int(math.ceil(duration / chunk_seconds))
+
+    chunks: List[Tuple[int, Path, float]] = []
+    missing_chunks: List[Tuple[int, Path, float]] = []
+
+    for index in range(chunk_count):
+        start = float(index * chunk_seconds)
+        if start >= duration:
+            break
+
+        wav_path = chunk_wav_path(work_dir, index)
+        chunks.append((index, wav_path, start))
+
+        if is_valid_file(wav_path, min_size=1024):
+            print(f"Reuse existing chunk wav: {wav_path.name}")
+        else:
+            missing_chunks.append((index, wav_path, start))
+
+    if not missing_chunks:
+        return chunks
+
+    workers = max(1, min(chunk_workers, len(missing_chunks)))
+    print(f"Create {len(missing_chunks)} missing chunk wav files directly from input with workers={workers}")
+
+    def create_chunk_wav(chunk_info: Tuple[int, Path, float]) -> int:
+        index, wav_path, start = chunk_info
+        print(f"Create chunk wav from input: {wav_path.name}, offset={start:.2f}s")
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-t", str(chunk_seconds),
+            "-i", str(media_path),
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            str(wav_path),
+        ])
+        return index
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(create_chunk_wav, chunk_info) for chunk_info in missing_chunks]
+        for future in as_completed(futures):
+            finished_index = future.result()
+            print(f"Finished creating chunk wav: chunk_{finished_index:04d}.wav")
+
+    return chunks
+
+
 def create_single_chunk_wav_if_needed(
     audio_path: Path,
     work_dir: Path,
@@ -380,6 +451,50 @@ def create_single_chunk_wav_if_needed(
             "-ss", f"{start:.3f}",
             "-t", str(chunk_seconds),
             "-i", str(audio_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            str(wav_path),
+        ])
+
+    return chunk_index, wav_path, start
+
+
+def create_single_chunk_wav_from_media_if_needed(
+    media_path: Path,
+    work_dir: Path,
+    chunk_index: int,
+    chunk_seconds: int,
+    force: bool = False,
+) -> Tuple[int, Path, float]:
+    """
+    直接从输入视频/音频生成指定 chunk 的 wav，用于 --only-chunk-srt 调试。
+    chunk_index 是 0-based。
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = get_media_duration(media_path)
+    start = float(chunk_index * chunk_seconds)
+    if start >= duration:
+        raise ValueError(f"chunk_index={chunk_index} 超出媒体时长范围，duration={duration:.2f}s")
+
+    wav_path = chunk_wav_path(work_dir, chunk_index)
+
+    if force and wav_path.exists():
+        print(f"Remove existing chunk wav because --force-chunks is set: {wav_path.name}")
+        wav_path.unlink()
+
+    if is_valid_file(wav_path, min_size=1024):
+        print(f"Reuse existing chunk wav: {wav_path.name}")
+    else:
+        print(f"Create only target chunk wav from input: {wav_path.name}, offset={start:.2f}s")
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-t", str(chunk_seconds),
+            "-i", str(media_path),
+            "-vn",
             "-ac", "1",
             "-ar", "16000",
             "-f", "wav",
@@ -1036,6 +1151,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-text-tokens-per-batch", type=int, default=600)
     parser.add_argument("--chunk-seconds", type=int, default=60)
+    parser.add_argument("--chunk-workers", type=int, default=5, help="并行生成 chunk wav 的 ffmpeg worker 数量")
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
     parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
     parser.add_argument("--max-chars", type=int, default=42)
@@ -1046,6 +1162,7 @@ def main() -> None:
     parser.add_argument("--force-chunks", action="store_true", help="强制重新切分 chunk wav")
     parser.add_argument("--force-asr", action="store_true", help="强制重新执行 ASR + ForcedAligner")
     parser.add_argument("--force-parts", action="store_true", help="强制重新生成 part srt")
+    parser.add_argument("--use-full-wav-cache", action="store_true", help="使用旧流程：先生成完整 16k mono wav，再从完整 wav 切 chunk")
     parser.add_argument("--parallel-first-two-only", action="store_true", help="只并行处理前两个 chunk，然后退出（用于调试）")
     parser.add_argument("--only-chunk-srt", nargs="?", const=1, type=int, help="只生成第 i 个 chunk 的 SRT；i 从 1 开始。不传 i 时默认 1")
 
@@ -1053,6 +1170,9 @@ def main() -> None:
 
     if args.chunk_seconds <= 0:
         raise ValueError("--chunk-seconds 必须大于 0")
+
+    if args.chunk_workers <= 0:
+        raise ValueError("--chunk-workers 必须大于 0")
 
     if args.part_chunks <= 0:
         raise ValueError("--part-chunks 必须大于 0")
@@ -1083,23 +1203,37 @@ def main() -> None:
 
     if args.force_parts:
         remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
-    
-    extract_audio_if_needed(video_path, full_wav)
+
+    chunk_source = full_wav if args.use_full_wav_cache else video_path
+
+    if args.use_full_wav_cache:
+        extract_audio_if_needed(video_path, full_wav)
+    else:
+        print("Direct chunk mode: skip full wav cache and create chunk wav files from input media.")
     
     if args.only_chunk_srt is not None:
         target_pos = args.only_chunk_srt - 1
-        total_chunks = get_chunk_count(full_wav, args.chunk_seconds)
+        total_chunks = get_media_chunk_count(chunk_source, args.chunk_seconds)
         
         if target_pos >= total_chunks:
             raise ValueError(f"--only-chunk-srt={args.only_chunk_srt} 超出范围；当前共有 {total_chunks} 个 chunks")
         
-        chunk_index, chunk_path, offset = create_single_chunk_wav_if_needed(
-            audio_path=full_wav,
-            work_dir=work_dir,
-            chunk_index=target_pos,
-            chunk_seconds=args.chunk_seconds,
-            force=args.force_chunks,
-        )
+        if args.use_full_wav_cache:
+            chunk_index, chunk_path, offset = create_single_chunk_wav_if_needed(
+                audio_path=full_wav,
+                work_dir=work_dir,
+                chunk_index=target_pos,
+                chunk_seconds=args.chunk_seconds,
+                force=args.force_chunks,
+            )
+        else:
+            chunk_index, chunk_path, offset = create_single_chunk_wav_from_media_if_needed(
+                media_path=video_path,
+                work_dir=work_dir,
+                chunk_index=target_pos,
+                chunk_seconds=args.chunk_seconds,
+                force=args.force_chunks,
+            )
         
         print(
             f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
@@ -1131,11 +1265,19 @@ def main() -> None:
         print(f"ONLY CHUNK SRT DONE: {srt_path}")
         return
     
-    chunks = split_audio_if_needed(
-        full_wav,
-        work_dir,
-        chunk_seconds=args.chunk_seconds,
-    )
+    if args.use_full_wav_cache:
+        chunks = split_audio_if_needed(
+            full_wav,
+            work_dir,
+            chunk_seconds=args.chunk_seconds,
+        )
+    else:
+        chunks = split_media_to_chunks_if_needed(
+            video_path,
+            work_dir,
+            chunk_seconds=args.chunk_seconds,
+            chunk_workers=args.chunk_workers,
+        )
     
     chunk_count = len(chunks)
     
@@ -1354,7 +1496,10 @@ def main() -> None:
     write_all_transcripts(work_dir, chunk_count, transcript_path)
 
     print("\nDone.")
-    print(f"Full wav: {full_wav}")
+    if args.use_full_wav_cache:
+        print(f"Full wav: {full_wav}")
+    else:
+        print("Full wav: skipped (--use-full-wav-cache not set)")
     print(f"Work dir: {work_dir}")
     print(f"SRT: {output_path}")
     print(f"Transcript: {transcript_path}")
