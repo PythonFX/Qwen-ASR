@@ -28,6 +28,7 @@ import math
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -702,7 +703,7 @@ def write_chunk_srt_if_needed(
     """
     srt_path = chunk_srt_path(work_dir, chunk_index)
 
-    if is_valid_file(srt_path, min_size=1):
+    if is_valid_file(srt_path, min_size=0):
         print(f"Reuse existing chunk srt: {srt_path.name}")
         return srt_path
 
@@ -805,7 +806,7 @@ def main() -> None:
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
     parser.add_argument("--chunk-seconds", type=int, default=280)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
-    parser.add_argument("--workers", type=int, default=1, help="并行处理 chunk 的 worker 数量；默认 1。MLX 推理并发会显著增加 unified memory 占用")
+    parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
     parser.add_argument("--max-chars", type=int, default=42)
     parser.add_argument("--max-duration", type=float, default=6.5)
     parser.add_argument("--pause-threshold", type=float, default=0.65)
@@ -814,6 +815,7 @@ def main() -> None:
     parser.add_argument("--force-chunks", action="store_true", help="强制重新切分 chunk wav")
     parser.add_argument("--force-asr", action="store_true", help="强制重新执行 ASR + ForcedAligner")
     parser.add_argument("--force-parts", action="store_true", help="强制重新生成 part srt")
+    parser.add_argument("--parallel-first-two-only", action="store_true", help="只并行处理前两个 chunk，然后退出（用于调试）")
 
     args = parser.parse_args()
 
@@ -823,8 +825,8 @@ def main() -> None:
     if args.part_chunks <= 0:
         raise ValueError("--part-chunks 必须大于 0")
 
-    if args.workers <= 0:
-        raise ValueError("--workers 必须大于 0")
+    if args.workers not in (1, 2):
+        raise ValueError("--workers 只支持 1 或 2。workers=2 时每个线程会单独加载一套模型。")
 
     require_ffmpeg()
 
@@ -865,75 +867,208 @@ def main() -> None:
 
     from mlx_audio.stt import load
 
-    print(f"Loading ASR model: {args.asr_model}")
-    asr_model = load(args.asr_model)
+    if args.parallel_first_two_only:
+        print(f"Loading ASR model: {args.asr_model}")
+        asr_model = load(args.asr_model)
 
-    print(f"Loading ForcedAligner model: {args.align_model}")
-    align_model = load(args.align_model)
+        print(f"Loading ForcedAligner model: {args.align_model}")
+        align_model = load(args.align_model)
+        print("DEBUG MODE: --parallel-first-two-only is enabled. Only chunk 0000 and 0001 will run sequentially, then the program exits.")
+        print("Note: MLX GPU inference is thread-bound here; Python thread parallelism is disabled to avoid `There is no Stream(gpu, 1) in current thread`.")
+        test_chunks = chunks[:2]
+        if len(test_chunks) < 2:
+            raise RuntimeError("Not enough chunks for --parallel-first-two-only")
 
-    workers = min(args.workers, chunk_count)
-    if workers != 1:
-        print(
-            f"Warning: requested workers={workers}, but MLX chunk inference is now forced to sequential mode "
-            "to avoid unified memory spikes. Effective workers=1."
-        )
-    else:
-        print("Process chunks sequentially with effective workers=1")
+        for done_count, (chunk_index, chunk_path, offset) in enumerate(test_chunks, start=1):
+            print(f"\nDEBUG [{done_count}/2] start chunk={chunk_index:04d}, offset={offset:.2f}s")
+            srt_path = chunk_srt_path(work_dir, chunk_index)
+            tokens_path = chunk_tokens_path(work_dir, chunk_index)
 
-    completed_chunks = set()
-
-    for done_count, (chunk_index, chunk_path, offset) in enumerate(chunks, start=1):
-        print(f"\n[{done_count}/{chunk_count}] start chunk={chunk_index:04d}, offset={offset:.2f}s")
-
-        srt_path = chunk_srt_path(work_dir, chunk_index)
-        tokens_path = chunk_tokens_path(work_dir, chunk_index)
-
-        if is_valid_file(srt_path, min_size=1) and is_valid_file(tokens_path, min_size=2):
-            print(f"Reuse completed chunk task: {srt_path.name}")
-            completed_chunks.add(chunk_index)
-        else:
             try:
-                _, tokens = process_chunk_if_needed(
-                    asr_model=asr_model,
-                    align_model=align_model,
-                    chunk_index=chunk_index,
-                    chunk_path=chunk_path,
-                    offset=offset,
-                    language=args.language,
-                    work_dir=work_dir,
-                )
+                if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
+                    print(f"DEBUG reuse completed chunk task: {srt_path.name}")
+                else:
+                    _, tokens = process_chunk_if_needed(
+                        asr_model=asr_model,
+                        align_model=align_model,
+                        chunk_index=chunk_index,
+                        chunk_path=chunk_path,
+                        offset=offset,
+                        language=args.language,
+                        work_dir=work_dir,
+                    )
+                    write_chunk_srt_if_needed(
+                        work_dir=work_dir,
+                        chunk_index=chunk_index,
+                        tokens=tokens,
+                        max_chars=args.max_chars,
+                        max_duration=args.max_duration,
+                        pause_threshold=args.pause_threshold,
+                    )
 
-                write_chunk_srt_if_needed(
+                if not is_valid_file(srt_path, min_size=0):
+                    raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
+
+                print(f"DEBUG [{done_count}/2] finished chunk={chunk_index:04d}; marker={srt_path.name}")
+            finally:
+                cleanup_after_inference()
+
+        cleanup_after_inference()
+        print("DEBUG MODE DONE: first two chunks finished sequentially. Exit now.")
+        return
+
+    if args.workers == 1:
+        print(f"Loading ASR model: {args.asr_model}")
+        asr_model = load(args.asr_model)
+
+        print(f"Loading ForcedAligner model: {args.align_model}")
+        align_model = load(args.align_model)
+
+        print("Process chunks sequentially with workers=1")
+
+        completed_chunks = set()
+
+        for done_count, (chunk_index, chunk_path, offset) in enumerate(chunks, start=1):
+            print(f"\n[{done_count}/{chunk_count}] start chunk={chunk_index:04d}, offset={offset:.2f}s")
+
+            srt_path = chunk_srt_path(work_dir, chunk_index)
+            tokens_path = chunk_tokens_path(work_dir, chunk_index)
+
+            if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
+                print(f"Reuse completed chunk task: {srt_path.name}")
+                completed_chunks.add(chunk_index)
+            else:
+                try:
+                    _, tokens = process_chunk_if_needed(
+                        asr_model=asr_model,
+                        align_model=align_model,
+                        chunk_index=chunk_index,
+                        chunk_path=chunk_path,
+                        offset=offset,
+                        language=args.language,
+                        work_dir=work_dir,
+                    )
+
+                    write_chunk_srt_if_needed(
+                        work_dir=work_dir,
+                        chunk_index=chunk_index,
+                        tokens=tokens,
+                        max_chars=args.max_chars,
+                        max_duration=args.max_duration,
+                        pause_threshold=args.pause_threshold,
+                    )
+
+                    if not is_valid_file(srt_path, min_size=0):
+                        raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
+
+                    completed_chunks.add(chunk_index)
+                finally:
+                    cleanup_after_inference()
+
+            print(f"[{done_count}/{chunk_count}] finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
+
+            group_start = (chunk_index // args.part_chunks) * args.part_chunks
+            group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
+            group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
+
+            if group_done:
+                build_and_write_part_srt_if_needed(
                     work_dir=work_dir,
-                    chunk_index=chunk_index,
-                    tokens=tokens,
+                    chunk_start=group_start,
+                    chunk_end=group_end,
                     max_chars=args.max_chars,
                     max_duration=args.max_duration,
                     pause_threshold=args.pause_threshold,
                 )
 
-                if not is_valid_file(srt_path, min_size=1):
-                    raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
+    else:
+        print("Process chunks with workers=2. Each worker thread loads its own ASR and ForcedAligner models.")
+        print("Note: this avoids sharing MLX GPU streams across threads, but roughly doubles model memory usage.")
 
-                completed_chunks.add(chunk_index)
+        worker_chunks = [chunks[0::2], chunks[1::2]]
+
+        def run_worker(worker_id: int, assigned_chunks: List[Tuple[int, Path, float]]) -> List[int]:
+            print(f"Worker {worker_id}: loading ASR model: {args.asr_model}")
+            worker_asr_model = load(args.asr_model)
+
+            print(f"Worker {worker_id}: loading ForcedAligner model: {args.align_model}")
+            worker_align_model = load(args.align_model)
+
+            finished: List[int] = []
+            try:
+                for local_pos, (chunk_index, chunk_path, offset) in enumerate(assigned_chunks, start=1):
+                    print(
+                        f"\nWorker {worker_id} [{local_pos}/{len(assigned_chunks)}] "
+                        f"start chunk={chunk_index:04d}, offset={offset:.2f}s"
+                    )
+
+                    srt_path = chunk_srt_path(work_dir, chunk_index)
+                    tokens_path = chunk_tokens_path(work_dir, chunk_index)
+
+                    try:
+                        if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
+                            print(f"Worker {worker_id}: reuse completed chunk task: {srt_path.name}")
+                        else:
+                            _, tokens = process_chunk_if_needed(
+                                asr_model=worker_asr_model,
+                                align_model=worker_align_model,
+                                chunk_index=chunk_index,
+                                chunk_path=chunk_path,
+                                offset=offset,
+                                language=args.language,
+                                work_dir=work_dir,
+                            )
+
+                            write_chunk_srt_if_needed(
+                                work_dir=work_dir,
+                                chunk_index=chunk_index,
+                                tokens=tokens,
+                                max_chars=args.max_chars,
+                                max_duration=args.max_duration,
+                                pause_threshold=args.pause_threshold,
+                            )
+
+                        if not is_valid_file(srt_path, min_size=0):
+                            raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
+
+                        finished.append(chunk_index)
+                        print(f"Worker {worker_id}: finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
+                    finally:
+                        cleanup_after_inference()
             finally:
+                del worker_asr_model
+                del worker_align_model
                 cleanup_after_inference()
 
-        print(f"[{done_count}/{chunk_count}] finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
+            return finished
 
-        group_start = (chunk_index // args.part_chunks) * args.part_chunks
-        group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
-        group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
+        completed_chunks = set()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(run_worker, worker_id, assigned)
+                for worker_id, assigned in enumerate(worker_chunks)
+                if assigned
+            ]
 
-        if group_done:
-            build_and_write_part_srt_if_needed(
-                work_dir=work_dir,
-                chunk_start=group_start,
-                chunk_end=group_end,
-                max_chars=args.max_chars,
-                max_duration=args.max_duration,
-                pause_threshold=args.pause_threshold,
+            for future in as_completed(futures):
+                completed_chunks.update(future.result())
+
+        for group_start in range(0, chunk_count, args.part_chunks):
+            group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
+            group_done = all(
+                is_valid_file(chunk_srt_path(work_dir, i), min_size=0)
+                and is_valid_file(chunk_tokens_path(work_dir, i), min_size=2)
+                for i in range(group_start, group_end + 1)
             )
+            if group_done:
+                build_and_write_part_srt_if_needed(
+                    work_dir=work_dir,
+                    chunk_start=group_start,
+                    chunk_end=group_end,
+                    max_chars=args.max_chars,
+                    max_duration=args.max_duration,
+                    pause_threshold=args.pause_threshold,
+                )
 
     cleanup_after_inference()
     all_tokens = load_all_cached_tokens(work_dir, chunk_count)
