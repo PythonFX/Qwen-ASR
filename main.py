@@ -59,6 +59,9 @@ def require_ffmpeg() -> None:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("找不到 ffmpeg。请先安装：brew install ffmpeg")
 
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("找不到 ffprobe。ffmpeg 安装后通常会自带 ffprobe。")
+
 
 def is_valid_file(path: Path, min_size: int = 1) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size >= min_size
@@ -99,12 +102,6 @@ def extract_audio_if_needed(video_path: Path, wav_path: Path) -> None:
 
 
 def get_audio_duration(audio_path: Path) -> float:
-    """
-    用 ffprobe 获取音频时长。
-    """
-    if not shutil.which("ffprobe"):
-        raise RuntimeError("找不到 ffprobe。ffmpeg 安装后通常会自带 ffprobe。")
-
     result = subprocess.run(
         [
             "ffprobe",
@@ -117,7 +114,12 @@ def get_audio_duration(audio_path: Path) -> float:
         text=True,
         stdout=subprocess.PIPE,
     )
-    return float(result.stdout.strip())
+
+    text = result.stdout.strip()
+    if not text:
+        raise RuntimeError(f"ffprobe 没有返回音频时长: {audio_path}")
+
+    return float(text)
 
 
 def get_chunk_count(audio_path: Path, chunk_seconds: int) -> int:
@@ -203,17 +205,58 @@ def normalize_transcript(text: str) -> str:
     return text
 
 
+def extract_text_from_asr_result(result) -> str:
+    """
+    从 ASR 返回结果中安全提取文本。
+
+    关键修复：
+    - 如果 result.text 存在但为空字符串，应该返回空字符串。
+    - 不要因为 text 为空，就 fallback 到 str(result)。
+    - 否则会把 STTOutput(text='', segments=...) 这种 repr 当成 transcript。
+    """
+    if result is None:
+        return ""
+
+    if isinstance(result, str):
+        return normalize_transcript(result)
+
+    if isinstance(result, dict):
+        return normalize_transcript(result.get("text") or "")
+
+    if hasattr(result, "text"):
+        return normalize_transcript(getattr(result, "text") or "")
+
+    print(f"Warning: unknown ASR result type: {type(result)}")
+    return ""
+
+
 def transcribe_chunk(asr_model, chunk_path: Path, language: str) -> str:
     result = asr_model.generate(str(chunk_path), language=language)
+    return extract_text_from_asr_result(result)
 
-    text = getattr(result, "text", None)
+
+def is_effective_transcript(text: str) -> bool:
+    """
+    判断 transcript 是否包含真正可对齐的内容。
+
+    只有空白、句号、逗号、感叹号等标点时，认为无效。
+    例如：
+      ""
+      "。"
+      "..."
+      "！？"
+    都会返回 False。
+    """
+    text = text.strip()
     if not text:
-        if isinstance(result, dict):
-            text = result.get("text", "")
-        else:
-            text = str(result)
+        return False
 
-    return normalize_transcript(text)
+    stripped = re.sub(
+        r"[\s。．\.，,、！？!?；;：:「」『』（）()\[\]【】《》〈〉…\-—_~〜\"'“”‘’]+",
+        "",
+        text,
+    )
+    return bool(stripped)
 
 
 def iter_align_items(align_result) -> Iterable:
@@ -248,7 +291,7 @@ def get_item_attr(item, *names, default=None):
 
 
 def align_chunk(align_model, chunk_path: Path, transcript: str, language: str, offset: float) -> List[AlignToken]:
-    if not transcript:
+    if not is_effective_transcript(transcript):
         return []
 
     result = align_model.generate(
@@ -293,14 +336,21 @@ def save_tokens(tokens: List[AlignToken], path: Path) -> None:
 
 def load_tokens(path: Path) -> List[AlignToken]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [
-        AlignToken(
-            text=str(item["text"]),
-            start=float(item["start"]),
-            end=float(item["end"]),
+
+    if not isinstance(data, list):
+        raise ValueError(f"tokens json 不是 list: {path}")
+
+    tokens: List[AlignToken] = []
+    for item in data:
+        tokens.append(
+            AlignToken(
+                text=str(item["text"]),
+                start=float(item["start"]),
+                end=float(item["end"]),
+            )
         )
-        for item in data
-    ]
+
+    return tokens
 
 
 def load_chunk_tokens_if_valid(path: Path) -> Optional[List[AlignToken]]:
@@ -345,8 +395,8 @@ def process_chunk_if_needed(
     print("Transcript:")
     print(transcript[:500] + ("..." if len(transcript) > 500 else ""))
 
-    if not transcript:
-        print("Empty transcript, skip align.")
+    if not is_effective_transcript(transcript):
+        print(f"No effective transcript, skip align. transcript={transcript!r}")
         save_tokens([], tokens_path)
         return transcript, []
 
@@ -570,34 +620,29 @@ def build_and_write_part_srt_if_needed(
     pause_threshold: float,
 ) -> None:
     """
-    每 10 个 chunk 生成一个中间 part srt。
+    每 N 个 chunk 生成一个中间 part srt。
 
     如果 part srt 已存在，并且对应 token 文件都存在，则跳过。
     """
-    actual_token_paths = [
-        chunk_tokens_path(work_dir, i)
-        for i in range(chunk_start, chunk_end + 1)
-        if chunk_tokens_path(work_dir, i).exists()
-    ]
+    token_paths: List[Path] = []
 
-    if not actual_token_paths:
-        return
+    for i in range(chunk_start, chunk_end + 1):
+        p = chunk_tokens_path(work_dir, i)
+        if not p.exists():
+            print(f"Part srt not ready, missing tokens: {p.name}")
+            return
+        token_paths.append(p)
 
     p = part_srt_path(work_dir, chunk_start, chunk_end)
 
-    all_token_files_exist = all(
-        chunk_tokens_path(work_dir, i).exists()
-        for i in range(chunk_start, chunk_end + 1)
-    )
-
-    if is_valid_file(p, min_size=1) and all_token_files_exist:
+    if is_valid_file(p, min_size=1):
         print(f"Reuse existing part srt: {p.name}")
         return
 
     print(f"Write part srt: {p.name}")
 
     tokens: List[AlignToken] = []
-    for token_path in actual_token_paths:
+    for token_path in token_paths:
         tokens.extend(load_tokens(token_path))
 
     tokens.sort(key=lambda x: (x.start, x.end))
@@ -650,6 +695,7 @@ def load_all_cached_tokens(work_dir: Path, chunk_count: int) -> List[AlignToken]
     for i in range(chunk_count):
         p = chunk_tokens_path(work_dir, i)
         if not p.exists():
+            print(f"Warning: missing token cache: {p.name}")
             continue
         tokens.extend(load_tokens(p))
 
@@ -665,12 +711,29 @@ def write_all_transcripts(work_dir: Path, chunk_count: int, output_path: Path) -
 
     for i in range(chunk_count):
         p = chunk_txt_path(work_dir, i)
-        if p.exists():
+        if exists_and_not_empty_text(p):
             text = p.read_text(encoding="utf-8").strip()
             if text:
                 parts.append(text)
 
     output_path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def exists_and_not_empty_text(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return False
+
+
+def remove_files(patterns: List[str], work_dir: Path) -> None:
+    for pattern in patterns:
+        for p in work_dir.glob(pattern):
+            print(f"Remove: {p.name}")
+            p.unlink()
 
 
 def main() -> None:
@@ -685,11 +748,19 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=42)
     parser.add_argument("--max-duration", type=float, default=6.5)
     parser.add_argument("--pause-threshold", type=float, default=0.65)
+
     parser.add_argument("--force-wav", action="store_true", help="强制重新生成全量 wav")
     parser.add_argument("--force-chunks", action="store_true", help="强制重新切分 chunk wav")
     parser.add_argument("--force-asr", action="store_true", help="强制重新执行 ASR + ForcedAligner")
     parser.add_argument("--force-parts", action="store_true", help="强制重新生成 part srt")
+
     args = parser.parse_args()
+
+    if args.chunk_seconds <= 0:
+        raise ValueError("--chunk-seconds 必须大于 0")
+
+    if args.part_chunks <= 0:
+        raise ValueError("--part-chunks 必须大于 0")
 
     require_ffmpeg()
 
@@ -707,19 +778,13 @@ def main() -> None:
         full_wav.unlink()
 
     if args.force_chunks:
-        for p in work_dir.glob("chunk_*.wav"):
-            print(f"Remove existing chunk wav because --force-chunks is set: {p.name}")
-            p.unlink()
+        remove_files(["chunk_*.wav"], work_dir)
 
     if args.force_asr:
-        for p in list(work_dir.glob("chunk_*.txt")) + list(work_dir.glob("chunk_*.tokens.json")):
-            print(f"Remove existing ASR cache because --force-asr is set: {p.name}")
-            p.unlink()
+        remove_files(["chunk_*.txt", "chunk_*.tokens.json", "all.tokens.json"], work_dir)
 
     if args.force_parts:
-        for p in work_dir.glob("part_*.srt"):
-            print(f"Remove existing part srt because --force-parts is set: {p.name}")
-            p.unlink()
+        remove_files(["part_*.srt"], work_dir)
 
     extract_audio_if_needed(video_path, full_wav)
 
@@ -730,6 +795,9 @@ def main() -> None:
     )
 
     chunk_count = len(chunks)
+
+    if chunk_count == 0:
+        raise RuntimeError("没有生成任何 chunk，请检查输入视频或音频。")
 
     from mlx_audio.stt import load
 
