@@ -27,6 +27,7 @@ import math
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -745,6 +746,7 @@ def main() -> None:
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
     parser.add_argument("--chunk-seconds", type=int, default=280)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
+    parser.add_argument("--workers", type=int, default=2, help="并行处理 chunk 的 worker 数量；共享同一组已加载模型，默认 2")
     parser.add_argument("--max-chars", type=int, default=42)
     parser.add_argument("--max-duration", type=float, default=6.5)
     parser.add_argument("--pause-threshold", type=float, default=0.65)
@@ -761,6 +763,9 @@ def main() -> None:
 
     if args.part_chunks <= 0:
         raise ValueError("--part-chunks 必须大于 0")
+
+    if args.workers <= 0:
+        raise ValueError("--workers 必须大于 0")
 
     require_ffmpeg()
 
@@ -807,8 +812,14 @@ def main() -> None:
     print(f"Loading ForcedAligner model: {args.align_model}")
     align_model = load(args.align_model)
 
-    for idx, (chunk_index, chunk_path, offset) in enumerate(chunks, start=1):
-        print(f"\n[{idx}/{chunk_count}] chunk={chunk_index:04d}")
+    workers = min(args.workers, chunk_count)
+    print(f"Process chunks with workers={workers} using shared loaded models")
+
+    completed_chunks = set()
+
+    def process_one_chunk(chunk_info: Tuple[int, Path, float]) -> int:
+        chunk_index, chunk_path, offset = chunk_info
+        print(f"\nStart chunk={chunk_index:04d}, offset={offset:.2f}s")
 
         process_chunk_if_needed(
             asr_model=asr_model,
@@ -820,15 +831,40 @@ def main() -> None:
             work_dir=work_dir,
         )
 
-        maybe_write_recent_part_srt(
-            work_dir=work_dir,
-            finished_chunk_index=chunk_index,
-            chunk_count=chunk_count,
-            part_size=args.part_chunks,
-            max_chars=args.max_chars,
-            max_duration=args.max_duration,
-            pause_threshold=args.pause_threshold,
-        )
+        return chunk_index
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_chunk = {
+            executor.submit(process_one_chunk, chunk_info): chunk_info[0]
+            for chunk_info in chunks
+        }
+
+        for done_count, future in enumerate(as_completed(future_to_chunk), start=1):
+            chunk_index = future_to_chunk[future]
+
+            try:
+                finished_chunk_index = future.result()
+            except Exception as e:
+                print(f"Chunk failed: chunk={chunk_index:04d}, error={e}")
+                raise
+
+            completed_chunks.add(finished_chunk_index)
+            print(f"\n[{done_count}/{chunk_count}] finished chunk={finished_chunk_index:04d}")
+
+            # part srt 必须等同一组内的所有 chunk 都完成后再生成。
+            group_start = (finished_chunk_index // args.part_chunks) * args.part_chunks
+            group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
+            group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
+
+            if group_done:
+                build_and_write_part_srt_if_needed(
+                    work_dir=work_dir,
+                    chunk_start=group_start,
+                    chunk_end=group_end,
+                    max_chars=args.max_chars,
+                    max_duration=args.max_duration,
+                    pause_threshold=args.pause_threshold,
+                )
 
     all_tokens = load_all_cached_tokens(work_dir, chunk_count)
     save_tokens(all_tokens, final_tokens_path(work_dir))
