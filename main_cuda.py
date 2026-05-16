@@ -195,6 +195,8 @@ class CudaForcedAlignModel:
                 text,
                 language=language,
             )
+        if isinstance(results, list) and len(results) == 1 and hasattr(results[0], "items"):
+            return results[0]
         if isinstance(results, list) and results and isinstance(results[0], list):
             return results[0]
         return results
@@ -702,6 +704,9 @@ def load_chunk_tokens_if_valid(path: Path) -> Optional[List[AlignToken]]:
         txt_path = path.with_name(path.name.replace(".tokens.json", ".txt"))
         if txt_path.exists():
             transcript = txt_path.read_text(encoding="utf-8")
+            if not tokens and is_effective_transcript(transcript):
+                print(f"Cached tokens are empty while transcript has content, will regenerate: {path.name}")
+                return None
             tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
         return tokens
     except Exception as e:
