@@ -867,6 +867,7 @@ def main() -> None:
     parser.add_argument("--force-asr", action="store_true", help="强制重新执行 ASR + ForcedAligner")
     parser.add_argument("--force-parts", action="store_true", help="强制重新生成 part srt")
     parser.add_argument("--parallel-first-two-only", action="store_true", help="只并行处理前两个 chunk，然后退出（用于调试）")
+    parser.add_argument("--only-chunk-srt", nargs="?", const=1, type=int, help="只生成第 i 个 chunk 的 SRT；i 从 1 开始。不传 i 时默认 1")
 
     args = parser.parse_args()
 
@@ -878,6 +879,9 @@ def main() -> None:
 
     if args.workers not in (1, 2):
         raise ValueError("--workers 只支持 1 或 2。workers=2 时每个线程会单独加载一套模型。")
+
+    if args.only_chunk_srt is not None and args.only_chunk_srt < 1:
+        raise ValueError("--only-chunk-srt 的 i 必须大于等于 1")
 
     require_ffmpeg()
 
@@ -917,6 +921,44 @@ def main() -> None:
         raise RuntimeError("没有生成任何 chunk，请检查输入视频或音频。")
 
     from mlx_audio.stt import load
+
+    if args.only_chunk_srt is not None:
+        target_pos = args.only_chunk_srt - 1
+        if target_pos >= chunk_count:
+            raise ValueError(f"--only-chunk-srt={args.only_chunk_srt} 超出范围；当前共有 {chunk_count} 个 chunks")
+
+        chunk_index, chunk_path, offset = chunks[target_pos]
+        print(f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
+
+        print(f"Loading ASR model: {args.asr_model}")
+        asr_model = load(args.asr_model)
+
+        print(f"Loading ForcedAligner model: {args.align_model}")
+        align_model = load(args.align_model)
+
+        try:
+            _, tokens = process_chunk_if_needed(
+                asr_model=asr_model,
+                align_model=align_model,
+                chunk_index=chunk_index,
+                chunk_path=chunk_path,
+                offset=offset,
+                language=args.language,
+                work_dir=work_dir,
+            )
+            srt_path = write_chunk_srt_if_needed(
+                work_dir=work_dir,
+                chunk_index=chunk_index,
+                tokens=tokens,
+                max_chars=args.max_chars,
+                max_duration=args.max_duration,
+                pause_threshold=args.pause_threshold,
+            )
+        finally:
+            cleanup_after_inference()
+
+        print(f"ONLY CHUNK SRT DONE: {srt_path}")
+        return
 
     if args.parallel_first_two_only:
         print(f"Loading ASR model: {args.asr_model}")
