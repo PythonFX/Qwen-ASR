@@ -378,9 +378,14 @@ def load_tokens(path: Path) -> List[AlignToken]:
 def load_chunk_tokens_if_valid(path: Path) -> Optional[List[AlignToken]]:
     if not is_valid_file(path, min_size=2):
         return None
-
+    
     try:
-        return load_tokens(path)
+        tokens = load_tokens(path)
+        txt_path = path.with_name(path.name.replace(".tokens.json", ".txt"))
+        if txt_path.exists():
+            transcript = txt_path.read_text(encoding="utf-8")
+            tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
+        return tokens
     except Exception as e:
         print(f"Failed to load cached tokens, will regenerate: {path.name}, error={e}")
         return None
@@ -424,6 +429,7 @@ def process_chunk_if_needed(
 
     print(f"Forced alignment chunk {chunk_index:04d}")
     tokens = align_chunk(align_model, chunk_path, transcript, language, offset=offset)
+    tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
     print(f"Aligned tokens: {len(tokens)}")
 
     save_tokens(tokens, tokens_path)
@@ -462,6 +468,46 @@ def token_ends_sentence(token_text: str) -> bool:
 def token_has_soft_punctuation(token_text: str) -> bool:
     return bool(re.search(r"[，,、：:]\s*$", token_text))
 
+def collect_inter_token_punctuation(text: str) -> str:
+    return re.sub(r"[^。．\.，,、！？!?；;：:…]", "", text)
+
+def apply_transcript_punctuation_to_tokens(tokens: List[AlignToken], transcript: str) -> List[AlignToken]:
+    if not tokens or not transcript:
+        return tokens
+
+    cursor = 0
+    fixed_tokens: List[AlignToken] = []
+
+    for idx, tok in enumerate(tokens):
+        token_text = tok.text.strip()
+        if not token_text:
+            fixed_tokens.append(tok)
+            continue
+
+        found_at = transcript.find(token_text, cursor)
+        if found_at < 0:
+            fixed_tokens.append(tok)
+            continue
+
+        token_end = found_at + len(token_text)
+        next_found_at = -1
+
+        if idx + 1 < len(tokens):
+            next_text = tokens[idx + 1].text.strip()
+            if next_text:
+                next_found_at = transcript.find(next_text, token_end)
+
+        gap_end = next_found_at if next_found_at >= 0 else token_end
+        punct = collect_inter_token_punctuation(transcript[token_end:gap_end])
+
+        if punct and not tok.text.endswith(punct):
+            fixed_tokens.append(AlignToken(text=tok.text + punct, start=tok.start, end=tok.end))
+        else:
+            fixed_tokens.append(tok)
+
+        cursor = token_end
+
+    return fixed_tokens
 
 def build_subtitles(
     tokens: List[AlignToken],
@@ -675,7 +721,9 @@ def build_and_write_part_srt_if_needed(
 
     tokens: List[AlignToken] = []
     for token_path in token_paths:
-        tokens.extend(load_tokens(token_path))
+        loaded = load_chunk_tokens_if_valid(token_path)
+        if loaded is not None:
+            tokens.extend(loaded)
 
     tokens.sort(key=lambda x: (x.start, x.end))
 
@@ -758,7 +806,10 @@ def load_all_cached_tokens(work_dir: Path, chunk_count: int) -> List[AlignToken]
         if not p.exists():
             print(f"Warning: missing token cache: {p.name}")
             continue
-        tokens.extend(load_tokens(p))
+
+        loaded = load_chunk_tokens_if_valid(p)
+        if loaded is not None:
+            tokens.extend(loaded)
 
     tokens.sort(key=lambda x: (x.start, x.end))
     return tokens
