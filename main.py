@@ -180,7 +180,7 @@ def split_audio_if_needed(
     chunk wav 会保存在：
       视频名.qwen3_srt_work/chunk_0000.wav
 
-    如果 chunk wav 已存在，则跳过该 chunk 的切分。
+    已存在的 chunk wav 会复用；缺失的 chunk wav 会用 5 个 worker 并发生成。
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,31 +188,51 @@ def split_audio_if_needed(
     chunk_count = get_chunk_count(audio_path, chunk_seconds)
 
     chunks: List[Tuple[int, Path, float]] = []
+    missing_chunks: List[Tuple[int, Path, float]] = []
 
     for index in range(chunk_count):
-        start = index * chunk_seconds
+        start = float(index * chunk_seconds)
         if start >= duration:
             break
 
         wav_path = chunk_wav_path(work_dir, index)
+        chunks.append((index, wav_path, start))
 
         if is_valid_file(wav_path, min_size=1024):
             print(f"Reuse existing chunk wav: {wav_path.name}")
         else:
-            print(f"Create chunk wav: {wav_path.name}, offset={start:.2f}s")
-            run_cmd([
-                "ffmpeg",
-                "-y",
-                "-ss", f"{start:.3f}",
-                "-t", str(chunk_seconds),
-                "-i", str(audio_path),
-                "-ac", "1",
-                "-ar", "16000",
-                "-f", "wav",
-                str(wav_path),
-            ])
+            missing_chunks.append((index, wav_path, start))
 
-        chunks.append((index, wav_path, float(start)))
+    if not missing_chunks:
+        return chunks
+
+    def chunk_creation_workers() -> int:
+        return 5
+
+    workers = min(chunk_creation_workers(), len(missing_chunks))
+    print(f"Create {len(missing_chunks)} missing chunk wav files with workers={workers}")
+
+    def create_chunk_wav(chunk_info: Tuple[int, Path, float]) -> int:
+        index, wav_path, start = chunk_info
+        print(f"Create chunk wav: {wav_path.name}, offset={start:.2f}s")
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-t", str(chunk_seconds),
+            "-i", str(audio_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            str(wav_path),
+        ])
+        return index
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(create_chunk_wav, chunk_info) for chunk_info in missing_chunks]
+        for future in as_completed(futures):
+            finished_index = future.result()
+            print(f"Finished creating chunk wav: chunk_{finished_index:04d}.wav")
 
     return chunks
 
