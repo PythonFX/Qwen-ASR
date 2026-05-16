@@ -1,2 +1,4 @@
-mlx_audio
 nagisa
+qwen-asr
+torch
+torchaudio
