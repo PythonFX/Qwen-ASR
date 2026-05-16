@@ -217,6 +217,48 @@ def split_audio_if_needed(
     return chunks
 
 
+def create_single_chunk_wav_if_needed(
+    audio_path: Path,
+    work_dir: Path,
+    chunk_index: int,
+    chunk_seconds: int,
+    force: bool = False,
+) -> Tuple[int, Path, float]:
+    """
+    只生成指定 chunk 的 wav，用于 --only-chunk-srt 调试。
+    chunk_index 是 0-based。
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    duration = get_audio_duration(audio_path)
+    start = float(chunk_index * chunk_seconds)
+    if start >= duration:
+        raise ValueError(f"chunk_index={chunk_index} 超出音频时长范围，duration={duration:.2f}s")
+
+    wav_path = chunk_wav_path(work_dir, chunk_index)
+
+    if force and wav_path.exists():
+        print(f"Remove existing chunk wav because --force-chunks is set: {wav_path.name}")
+        wav_path.unlink()
+
+    if is_valid_file(wav_path, min_size=1024):
+        print(f"Reuse existing chunk wav: {wav_path.name}")
+    else:
+        print(f"Create only target chunk wav: {wav_path.name}, offset={start:.2f}s")
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-t", str(chunk_seconds),
+            "-i", str(audio_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            str(wav_path),
+        ])
+
+    return chunk_index, wav_path, start
+
 def normalize_transcript(text: str) -> str:
     """
     轻微清理 ASR 文本，避免把奇怪空白带进 aligner。
@@ -855,7 +897,7 @@ def main() -> None:
     parser.add_argument("--language", default="Japanese", help="语言，例如 Chinese / English / Japanese / Cantonese")
     parser.add_argument("--asr-model", default=ASR_MODEL_PATH)
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
-    parser.add_argument("--chunk-seconds", type=int, default=280)
+    parser.add_argument("--chunk-seconds", type=int, default=180)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
     parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
     parser.add_argument("--max-chars", type=int, default=42)
@@ -906,36 +948,35 @@ def main() -> None:
 
     if args.force_parts:
         remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
-
+    
     extract_audio_if_needed(video_path, full_wav)
-
-    chunks = split_audio_if_needed(
-        full_wav,
-        work_dir,
-        chunk_seconds=args.chunk_seconds,
-    )
-
-    chunk_count = len(chunks)
-
-    if chunk_count == 0:
-        raise RuntimeError("没有生成任何 chunk，请检查输入视频或音频。")
-
+    
     from mlx_audio.stt import load
-
+    
     if args.only_chunk_srt is not None:
         target_pos = args.only_chunk_srt - 1
-        if target_pos >= chunk_count:
-            raise ValueError(f"--only-chunk-srt={args.only_chunk_srt} 超出范围；当前共有 {chunk_count} 个 chunks")
-
-        chunk_index, chunk_path, offset = chunks[target_pos]
-        print(f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
-
+        total_chunks = get_chunk_count(full_wav, args.chunk_seconds)
+        
+        if target_pos >= total_chunks:
+            raise ValueError(f"--only-chunk-srt={args.only_chunk_srt} 超出范围；当前共有 {total_chunks} 个 chunks")
+        
+        chunk_index, chunk_path, offset = create_single_chunk_wav_if_needed(
+            audio_path=full_wav,
+            work_dir=work_dir,
+            chunk_index=target_pos,
+            chunk_seconds=args.chunk_seconds,
+            force=args.force_chunks,
+        )
+        
+        print(
+            f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
+        
         print(f"Loading ASR model: {args.asr_model}")
         asr_model = load(args.asr_model)
-
+        
         print(f"Loading ForcedAligner model: {args.align_model}")
         align_model = load(args.align_model)
-
+        
         try:
             _, tokens = process_chunk_if_needed(
                 asr_model=asr_model,
@@ -956,9 +997,20 @@ def main() -> None:
             )
         finally:
             cleanup_after_inference()
-
+        
         print(f"ONLY CHUNK SRT DONE: {srt_path}")
         return
+    
+    chunks = split_audio_if_needed(
+        full_wav,
+        work_dir,
+        chunk_seconds=args.chunk_seconds,
+    )
+    
+    chunk_count = len(chunks)
+    
+    if chunk_count == 0:
+        raise RuntimeError("没有生成任何 chunk，请检查输入视频或音频。")
 
     if args.parallel_first_two_only:
         print(f"Loading ASR model: {args.asr_model}")
