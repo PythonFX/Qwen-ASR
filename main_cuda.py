@@ -134,6 +134,29 @@ class CudaASRModel:
             return results[0] if results else ""
         return results
 
+    def generate_batch(self, audio_paths: Sequence[str], language: str) -> List:
+        paths = [str(p) for p in audio_paths]
+        if not paths:
+            return []
+        if len(paths) == 1:
+            return [self.generate(paths[0], language)]
+
+        try:
+            results = self.model.transcribe(
+                paths,
+                language=language,
+                return_time_stamps=False,
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            print(f"ASR batch input is not supported by this qwen-asr version, fallback to single-chunk ASR: {exc}")
+            return [self.generate(path, language) for path in paths]
+
+        if isinstance(results, list) and len(results) == len(paths):
+            return results
+
+        print("ASR batch returned an unexpected shape, fallback to single-chunk ASR.")
+        return [self.generate(path, language) for path in paths]
+
 
 class CudaForcedAlignModel:
     def __init__(
@@ -731,6 +754,76 @@ def process_chunk_if_needed(
     return transcript, tokens
 
 
+def process_chunks_batch_if_needed(
+    asr_model,
+    align_model,
+    chunk_infos: List[Tuple[int, Path, float]],
+    language: str,
+    work_dir: Path,
+) -> List[Tuple[int, str, List[AlignToken]]]:
+    """
+    Batch ASR for multiple chunks with one loaded CUDA model, then run forced alignment per chunk.
+    Cached token files are reused and skipped from the ASR batch.
+    """
+    results_by_index: dict[int, Tuple[str, List[AlignToken]]] = {}
+    pending: List[Tuple[int, Path, float]] = []
+
+    for chunk_index, chunk_path, _offset in chunk_infos:
+        txt_path = chunk_txt_path(work_dir, chunk_index)
+        tokens_path = chunk_tokens_path(work_dir, chunk_index)
+
+        cached_tokens = load_chunk_tokens_if_valid(tokens_path)
+        if cached_tokens is not None:
+            print(f"Reuse cached ASR+align result: {tokens_path.name}")
+            transcript = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
+            results_by_index[chunk_index] = (transcript, cached_tokens)
+        else:
+            pending.append((chunk_index, chunk_path, _offset))
+
+    if pending:
+        batch_names = ", ".join(chunk_path.name for _, chunk_path, _ in pending)
+        print(f"\nASR batch ({len(pending)} chunks): {batch_names}")
+        raw_results = asr_model.generate_batch(
+            [str(chunk_path) for _, chunk_path, _ in pending],
+            language=language,
+        )
+        transcripts = [extract_text_from_asr_result(result) for result in raw_results]
+
+        if len(transcripts) != len(pending):
+            raise RuntimeError(
+                f"ASR batch result count mismatch: expected={len(pending)}, actual={len(transcripts)}"
+            )
+
+        for (chunk_index, chunk_path, offset), transcript in zip(pending, transcripts):
+            txt_path = chunk_txt_path(work_dir, chunk_index)
+            tokens_path = chunk_tokens_path(work_dir, chunk_index)
+
+            txt_path.write_text(transcript, encoding="utf-8")
+
+            print(f"\nASR chunk {chunk_index:04d}: {chunk_path.name}, offset={offset:.2f}s")
+            print("Transcript:")
+            print(transcript[:500] + ("..." if len(transcript) > 500 else ""))
+
+            if not is_effective_transcript(transcript):
+                print(f"No effective transcript, skip align. transcript={transcript!r}")
+                save_tokens([], tokens_path)
+                results_by_index[chunk_index] = (transcript, [])
+                continue
+
+            print(f"Forced alignment chunk {chunk_index:04d}")
+            tokens = align_chunk(align_model, chunk_path, transcript, language, offset=offset)
+            tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
+            print(f"Aligned tokens: {len(tokens)}")
+
+            save_tokens(tokens, tokens_path)
+            results_by_index[chunk_index] = (transcript, tokens)
+
+    return [
+        (chunk_index, results_by_index[chunk_index][0], results_by_index[chunk_index][1])
+        for chunk_index, _chunk_path, _offset in chunk_infos
+    ]
+
+
 def is_cjk_text(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", s))
 
@@ -1159,6 +1252,7 @@ def main() -> None:
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-text-tokens-per-batch", type=int, default=600)
+    parser.add_argument("--asr-batch-size", type=int, default=4, help="ASR batch size for one loaded CUDA model")
     parser.add_argument("--chunk-seconds", type=int, default=60)
     parser.add_argument("--chunk-workers", type=int, default=5, help="并行生成 chunk wav 的 ffmpeg worker 数量")
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
@@ -1179,6 +1273,9 @@ def main() -> None:
 
     if args.chunk_seconds <= 0:
         raise ValueError("--chunk-seconds 必须大于 0")
+
+    if args.asr_batch_size <= 0:
+        raise ValueError("--asr-batch-size 必须大于 0")
 
     if args.chunk_workers <= 0:
         raise ValueError("--chunk-workers 必须大于 0")
@@ -1350,31 +1447,27 @@ def main() -> None:
         asr_model = load_cuda_asr_model(args)
         align_model = load_cuda_align_model(args)
 
-        print("Process chunks sequentially with workers=1")
+        print(f"Process chunks with workers=1 and ASR batch size={args.asr_batch_size}")
 
         completed_chunks = set()
+        done_count = 0
 
-        for done_count, (chunk_index, chunk_path, offset) in enumerate(chunks, start=1):
-            print(f"\n[{done_count}/{chunk_count}] start chunk={chunk_index:04d}, offset={offset:.2f}s")
+        for batch_start in range(0, chunk_count, args.asr_batch_size):
+            batch = chunks[batch_start:batch_start + args.asr_batch_size]
+            batch_end = batch_start + len(batch)
+            print(f"\nBatch chunks [{batch_start + 1}-{batch_end}/{chunk_count}]")
 
-            srt_path = chunk_srt_path(work_dir, chunk_index)
-            tokens_path = chunk_tokens_path(work_dir, chunk_index)
+            try:
+                batch_results = process_chunks_batch_if_needed(
+                    asr_model=asr_model,
+                    align_model=align_model,
+                    chunk_infos=batch,
+                    language=args.language,
+                    work_dir=work_dir,
+                )
 
-            if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
-                print(f"Reuse completed chunk task: {srt_path.name}")
-                completed_chunks.add(chunk_index)
-            else:
-                try:
-                    _, tokens = process_chunk_if_needed(
-                        asr_model=asr_model,
-                        align_model=align_model,
-                        chunk_index=chunk_index,
-                        chunk_path=chunk_path,
-                        offset=offset,
-                        language=args.language,
-                        work_dir=work_dir,
-                    )
-
+                for chunk_index, _transcript, tokens in batch_results:
+                    srt_path = chunk_srt_path(work_dir, chunk_index)
                     write_chunk_srt_if_needed(
                         work_dir=work_dir,
                         chunk_index=chunk_index,
@@ -1388,24 +1481,24 @@ def main() -> None:
                         raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
 
                     completed_chunks.add(chunk_index)
-                finally:
-                    cleanup_after_inference()
+                    done_count += 1
+                    print(f"[{done_count}/{chunk_count}] finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
 
-            print(f"[{done_count}/{chunk_count}] finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
+                    group_start = (chunk_index // args.part_chunks) * args.part_chunks
+                    group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
+                    group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
 
-            group_start = (chunk_index // args.part_chunks) * args.part_chunks
-            group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
-            group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
-
-            if group_done:
-                build_and_write_part_srt_if_needed(
-                    work_dir=work_dir,
-                    chunk_start=group_start,
-                    chunk_end=group_end,
-                    max_chars=args.max_chars,
-                    max_duration=args.max_duration,
-                    pause_threshold=args.pause_threshold,
-                )
+                    if group_done:
+                        build_and_write_part_srt_if_needed(
+                            work_dir=work_dir,
+                            chunk_start=group_start,
+                            chunk_end=group_end,
+                            max_chars=args.max_chars,
+                            max_duration=args.max_duration,
+                            pause_threshold=args.pause_threshold,
+                        )
+            finally:
+                cleanup_after_inference()
 
     else:
         print("Process chunks with workers=2. Each worker thread loads its own ASR and ForcedAligner models.")
