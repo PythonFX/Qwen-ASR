@@ -157,12 +157,21 @@ class CudaForcedAlignModel:
         )
 
     def generate(self, audio: str, text: str, language: str):
-        results = self.model.align(
-            audio,
-            text,
-            language=language,
-            max_text_tokens_per_batch=self.max_text_tokens_per_batch,
-        )
+        try:
+            results = self.model.align(
+                audio,
+                text,
+                language=language,
+                max_text_tokens_per_batch=self.max_text_tokens_per_batch,
+            )
+        except TypeError as exc:
+            if "max_text_tokens_per_batch" not in str(exc):
+                raise
+            results = self.model.align(
+                audio,
+                text,
+                language=language,
+            )
         if isinstance(results, list) and results and isinstance(results[0], list):
             return results[0]
         return results
@@ -359,7 +368,7 @@ def split_media_to_chunks_if_needed(
     media_path: Path,
     work_dir: Path,
     chunk_seconds: int = 280,
-    chunk_workers: int = 5,
+    chunk_workers: int = 10,
 ) -> List[Tuple[int, Path, float]]:
     """
     直接从输入视频/音频并行导出 16kHz mono chunk wav，跳过完整中间 wav。
@@ -1153,7 +1162,7 @@ def main() -> None:
     parser.add_argument("--chunk-seconds", type=int, default=60)
     parser.add_argument("--chunk-workers", type=int, default=5, help="并行生成 chunk wav 的 ffmpeg worker 数量")
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
-    parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
+    parser.add_argument("--workers", type=int, default=1, help="ASR/align worker 数量。CUDA/Transformers 模式建议固定为 1；chunk wav 生成并行度用 --chunk-workers 控制")
     parser.add_argument("--max-chars", type=int, default=42)
     parser.add_argument("--max-duration", type=float, default=6.5)
     parser.add_argument("--pause-threshold", type=float, default=0.65)
@@ -1176,6 +1185,13 @@ def main() -> None:
 
     if args.part_chunks <= 0:
         raise ValueError("--part-chunks 必须大于 0")
+
+    if args.workers != 1:
+        raise ValueError(
+            "main_cuda.py 当前只支持 --workers 1。"
+            "Transformers/Accelerate 在多线程里并发加载多套 CUDA 模型容易触发 meta tensor 错误；"
+            "切 chunk 的并行加速请使用 --chunk-workers。"
+        )
 
     if args.only_chunk_srt is not None and args.only_chunk_srt < 1:
         raise ValueError("--only-chunk-srt 的 i 必须大于等于 1")
@@ -1276,7 +1292,6 @@ def main() -> None:
             video_path,
             work_dir,
             chunk_seconds=args.chunk_seconds,
-            chunk_workers=args.chunk_workers,
         )
     
     chunk_count = len(chunks)
