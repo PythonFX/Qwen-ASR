@@ -22,12 +22,12 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -62,6 +62,22 @@ def require_ffmpeg() -> None:
 
     if not shutil.which("ffprobe"):
         raise RuntimeError("找不到 ffprobe。ffmpeg 安装后通常会自带 ffprobe。")
+
+
+def cleanup_after_inference() -> None:
+    """
+    尽量释放每个 chunk 推理后的临时内存。
+
+    MLX 多线程并发推理时，即使共享同一个模型对象，
+    推理图、中间张量和 cache 仍可能叠加，导致 unified memory 暴涨。
+    """
+    gc.collect()
+
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
 
 
 def is_valid_file(path: Path, min_size: int = 1) -> bool:
@@ -138,6 +154,10 @@ def chunk_txt_path(work_dir: Path, index: int) -> Path:
 
 def chunk_tokens_path(work_dir: Path, index: int) -> Path:
     return work_dir / f"chunk_{index:04d}.tokens.json"
+
+
+def chunk_srt_path(work_dir: Path, index: int) -> Path:
+    return work_dir / f"chunk_{index:04d}.srt"
 
 
 def part_srt_path(work_dir: Path, start_index: int, end_index: int) -> Path:
@@ -589,6 +609,16 @@ def write_srt(subtitles: List[Subtitle], output_path: Path) -> None:
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_srt_atomic(subtitles: List[Subtitle], output_path: Path) -> None:
+    """
+    原子写入 SRT：先写临时文件，再 replace 成目标文件。
+    这样外部检查到目标 srt 存在时，可以认为它已经完整写入。
+    """
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    write_srt(subtitles, tmp_path)
+    tmp_path.replace(output_path)
+
+
 def write_srt_with_index_offset(
     subtitles: List[Subtitle],
     output_path: Path,
@@ -656,6 +686,35 @@ def build_and_write_part_srt_if_needed(
     )
 
     write_srt_with_index_offset(subtitles, p, start_index=1)
+
+
+def write_chunk_srt_if_needed(
+    work_dir: Path,
+    chunk_index: int,
+    tokens: List[AlignToken],
+    max_chars: int,
+    max_duration: float,
+    pause_threshold: float,
+) -> Path:
+    """
+    每个 chunk 完成后写一个 chunk 级 SRT 作为完成标记。
+    下一个 chunk 只有在这个文件完整写入后才会启动。
+    """
+    srt_path = chunk_srt_path(work_dir, chunk_index)
+
+    if is_valid_file(srt_path, min_size=1):
+        print(f"Reuse existing chunk srt: {srt_path.name}")
+        return srt_path
+
+    subtitles = build_subtitles(
+        tokens,
+        max_chars=max_chars,
+        max_duration=max_duration,
+        pause_threshold=pause_threshold,
+    )
+    write_srt_atomic(subtitles, srt_path)
+    print(f"Write chunk srt: {srt_path.name}")
+    return srt_path
 
 
 def maybe_write_recent_part_srt(
@@ -746,7 +805,7 @@ def main() -> None:
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
     parser.add_argument("--chunk-seconds", type=int, default=280)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
-    parser.add_argument("--workers", type=int, default=2, help="并行处理 chunk 的 worker 数量；共享同一组已加载模型，默认 2")
+    parser.add_argument("--workers", type=int, default=1, help="并行处理 chunk 的 worker 数量；默认 1。MLX 推理并发会显著增加 unified memory 占用")
     parser.add_argument("--max-chars", type=int, default=42)
     parser.add_argument("--max-duration", type=float, default=6.5)
     parser.add_argument("--pause-threshold", type=float, default=0.65)
@@ -786,10 +845,10 @@ def main() -> None:
         remove_files(["chunk_*.wav"], work_dir)
 
     if args.force_asr:
-        remove_files(["chunk_*.txt", "chunk_*.tokens.json", "all.tokens.json"], work_dir)
+        remove_files(["chunk_*.txt", "chunk_*.tokens.json", "chunk_*.srt", "all.tokens.json", "part_*.srt"], work_dir)
 
     if args.force_parts:
-        remove_files(["part_*.srt"], work_dir)
+        remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
 
     extract_audio_if_needed(video_path, full_wav)
 
@@ -813,59 +872,70 @@ def main() -> None:
     align_model = load(args.align_model)
 
     workers = min(args.workers, chunk_count)
-    print(f"Process chunks with workers={workers} using shared loaded models")
+    if workers != 1:
+        print(
+            f"Warning: requested workers={workers}, but MLX chunk inference is now forced to sequential mode "
+            "to avoid unified memory spikes. Effective workers=1."
+        )
+    else:
+        print("Process chunks sequentially with effective workers=1")
 
     completed_chunks = set()
 
-    def process_one_chunk(chunk_info: Tuple[int, Path, float]) -> int:
-        chunk_index, chunk_path, offset = chunk_info
-        print(f"\nStart chunk={chunk_index:04d}, offset={offset:.2f}s")
+    for done_count, (chunk_index, chunk_path, offset) in enumerate(chunks, start=1):
+        print(f"\n[{done_count}/{chunk_count}] start chunk={chunk_index:04d}, offset={offset:.2f}s")
 
-        process_chunk_if_needed(
-            asr_model=asr_model,
-            align_model=align_model,
-            chunk_index=chunk_index,
-            chunk_path=chunk_path,
-            offset=offset,
-            language=args.language,
-            work_dir=work_dir,
-        )
+        srt_path = chunk_srt_path(work_dir, chunk_index)
+        tokens_path = chunk_tokens_path(work_dir, chunk_index)
 
-        return chunk_index
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_chunk = {
-            executor.submit(process_one_chunk, chunk_info): chunk_info[0]
-            for chunk_info in chunks
-        }
-
-        for done_count, future in enumerate(as_completed(future_to_chunk), start=1):
-            chunk_index = future_to_chunk[future]
-
+        if is_valid_file(srt_path, min_size=1) and is_valid_file(tokens_path, min_size=2):
+            print(f"Reuse completed chunk task: {srt_path.name}")
+            completed_chunks.add(chunk_index)
+        else:
             try:
-                finished_chunk_index = future.result()
-            except Exception as e:
-                print(f"Chunk failed: chunk={chunk_index:04d}, error={e}")
-                raise
-
-            completed_chunks.add(finished_chunk_index)
-            print(f"\n[{done_count}/{chunk_count}] finished chunk={finished_chunk_index:04d}")
-
-            # part srt 必须等同一组内的所有 chunk 都完成后再生成。
-            group_start = (finished_chunk_index // args.part_chunks) * args.part_chunks
-            group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
-            group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
-
-            if group_done:
-                build_and_write_part_srt_if_needed(
+                _, tokens = process_chunk_if_needed(
+                    asr_model=asr_model,
+                    align_model=align_model,
+                    chunk_index=chunk_index,
+                    chunk_path=chunk_path,
+                    offset=offset,
+                    language=args.language,
                     work_dir=work_dir,
-                    chunk_start=group_start,
-                    chunk_end=group_end,
+                )
+
+                write_chunk_srt_if_needed(
+                    work_dir=work_dir,
+                    chunk_index=chunk_index,
+                    tokens=tokens,
                     max_chars=args.max_chars,
                     max_duration=args.max_duration,
                     pause_threshold=args.pause_threshold,
                 )
 
+                if not is_valid_file(srt_path, min_size=1):
+                    raise RuntimeError(f"chunk srt was not written successfully: {srt_path}")
+
+                completed_chunks.add(chunk_index)
+            finally:
+                cleanup_after_inference()
+
+        print(f"[{done_count}/{chunk_count}] finished chunk={chunk_index:04d}; completion_marker={srt_path.name}")
+
+        group_start = (chunk_index // args.part_chunks) * args.part_chunks
+        group_end = min(group_start + args.part_chunks - 1, chunk_count - 1)
+        group_done = all(i in completed_chunks for i in range(group_start, group_end + 1))
+
+        if group_done:
+            build_and_write_part_srt_if_needed(
+                work_dir=work_dir,
+                chunk_start=group_start,
+                chunk_end=group_end,
+                max_chars=args.max_chars,
+                max_duration=args.max_duration,
+                pause_threshold=args.pause_threshold,
+            )
+
+    cleanup_after_inference()
     all_tokens = load_all_cached_tokens(work_dir, chunk_count)
     save_tokens(all_tokens, final_tokens_path(work_dir))
 
