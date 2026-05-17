@@ -571,6 +571,23 @@ def apply_transcript_punctuation_to_tokens(tokens: List[AlignToken], transcript:
 
     return fixed_tokens
 
+def fix_abnormal_token_durations(tokens: List[AlignToken]) -> List[AlignToken]:
+    """
+    修正 forced aligner 因噪声导致的时间戳异常：
+    当 1-2 字 token 的时长超过 4 秒时，将其起始时间修正为 end - 0.5s/字。
+    """
+    fixed = []
+    for tok in tokens:
+        char_count = len(tok.text.strip())
+        duration = tok.end - tok.start
+        if 0 < char_count <= 2 and duration > 4.0:
+            new_start = tok.end - 0.5 * char_count
+            fixed.append(AlignToken(text=tok.text, start=new_start, end=tok.end))
+        else:
+            fixed.append(tok)
+    return fixed
+
+
 def build_subtitles(
     tokens: List[AlignToken],
     max_chars: int = 42,
@@ -588,6 +605,7 @@ def build_subtitles(
     """
     subtitles: List[Subtitle] = []
     buf: List[AlignToken] = []
+    tokens = fix_abnormal_token_durations(tokens)
 
     def flush():
         nonlocal buf
