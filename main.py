@@ -620,7 +620,7 @@ def build_subtitles(
         enough_text = len(text_now) >= min_chars
         too_long_text = len(text_now) >= max_chars
         too_long_time = dur_now >= max_duration
-        good_sentence_end = token_ends_sentence(tok.text) and enough_text
+        good_sentence_end = token_ends_sentence(tok.text)
         good_pause = next_pause >= pause_threshold and enough_text
         soft_punct_cut = token_has_soft_punctuation(tok.text) and len(text_now) >= int(max_chars * 0.75)
 
@@ -634,7 +634,7 @@ def build_subtitles(
         )
 
         if should_flush:
-            if dur_now < min_duration and next_tok is not None:
+            if not good_sentence_end and dur_now < min_duration and next_tok is not None:
                 continue
             flush()
 
@@ -649,9 +649,11 @@ def merge_too_short_subtitles(
     min_duration: float = 0.5,
     max_merged_chars: int = 52,
     max_merged_duration: float = 7.5,
+    max_gap: float = 1.0,
 ) -> List[Subtitle]:
     """
     合并过短字幕，避免 SRT 阅读体验太碎。
+    只在两条字幕间隔 <= max_gap 秒时才合并。
     """
     if not subtitles:
         return []
@@ -667,8 +669,9 @@ def merge_too_short_subtitles(
         prev = merged[-1]
         combined_text = combine_subtitle_text(prev.text, sub.text)
         combined_duration = sub.end - prev.start
+        gap = sub.start - prev.end
 
-        if too_short and len(combined_text) <= max_merged_chars and combined_duration <= max_merged_duration:
+        if too_short and len(combined_text) <= max_merged_chars and combined_duration <= max_merged_duration and gap <= max_gap:
             merged[-1] = Subtitle(
                 start=prev.start,
                 end=sub.end,
