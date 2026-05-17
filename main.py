@@ -931,6 +931,7 @@ def main() -> None:
     parser.add_argument("--force-chunks", action="store_true", help="强制重新切分 chunk wav")
     parser.add_argument("--force-asr", action="store_true", help="强制重新执行 ASR + ForcedAligner")
     parser.add_argument("--force-parts", action="store_true", help="强制重新生成 part srt")
+    parser.add_argument("--force-srt", action="store_true", help="强制重新生成所有 srt（不重新跑 ASR，仅从已有 tokens 重新断句）")
     parser.add_argument("--parallel-first-two-only", action="store_true", help="只并行处理前两个 chunk，然后退出（用于调试）")
     parser.add_argument("--only-chunk-srt", nargs="?", const=1, type=int, help="只生成第 i 个 chunk 的 SRT；i 从 1 开始。不传 i 时默认 1")
 
@@ -970,6 +971,9 @@ def main() -> None:
         remove_files(["chunk_*.txt", "chunk_*.tokens.json", "chunk_*.srt", "all.tokens.json", "part_*.srt"], work_dir)
 
     if args.force_parts:
+        remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
+
+    if args.force_srt:
         remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
     
     extract_audio_if_needed(video_path, full_wav)
