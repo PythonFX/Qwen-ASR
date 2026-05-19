@@ -347,13 +347,6 @@ def process_chunk_if_needed(
     tokens = align_chunk(align_model, chunk_path, transcript, language, offset=offset)
     tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
 
-    if speech_regions:
-        before_count = len(tokens)
-        tokens = clip_tokens_to_speech(tokens, speech_regions)
-        clipped_count = before_count - len(tokens)
-        if clipped_count > 0:
-            print(f"Clipped {clipped_count} tokens outside speech regions")
-
     print(f"Aligned tokens: {len(tokens)}")
 
     save_tokens(tokens, tokens_path)

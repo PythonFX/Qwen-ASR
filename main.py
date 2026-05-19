@@ -46,6 +46,7 @@ from pipeline import (
     build_and_write_part_srt_if_needed,
     load_all_cached_tokens,
     write_all_transcripts,
+    merge_chunk_srts_to_final,
 )
 
 
@@ -79,7 +80,7 @@ def main() -> None:
     parser.add_argument("--language", default="Japanese", help="语言，例如 Chinese / English / Japanese / Cantonese")
     parser.add_argument("--asr-model", default=ASR_MODEL_PATH)
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
-    parser.add_argument("--chunk-seconds", type=int, default=180)
+    parser.add_argument("--chunk-seconds", type=int, default=60)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
     parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
     parser.add_argument("--max-chars", type=int, default=42)
@@ -100,6 +101,7 @@ def main() -> None:
     parser.add_argument("--vad-min-silence-ms", type=int, default=300, help="最短静音间隔 ms（默认 300）")
     parser.add_argument("--vad-speech-pad-ms", type=int, default=300, help="VAD 语音段前后 padding ms（默认 300）")
     parser.add_argument("--vad-chunk-pad", type=float, default=1.0, help="VAD chunk 前后额外扩展秒数，给 ASR 更多上下文（默认 1.0）")
+    parser.add_argument("--max-chunks", type=int, default=0, help="最多处理前 N 个 chunk，0 表示全部（用于调试）")
 
     args = parser.parse_args()
 
@@ -277,10 +279,24 @@ def main() -> None:
 
     chunk_count = len(chunks)
 
+    if args.max_chunks > 0 and args.max_chunks < chunk_count:
+        print(f"--max-chunks: limiting to {args.max_chunks}/{chunk_count} chunks")
+        chunks = chunks[:args.max_chunks]
+        chunk_count = args.max_chunks
+
     if chunk_count == 0:
         raise RuntimeError("没有生成任何 chunk，请检查输入视频或音频。")
 
-    if args.parallel_first_two_only:
+    # Check if all chunks are already fully processed
+    all_chunks_done = all(
+        is_valid_file(chunk_srt_path(work_dir, i), min_size=0)
+        and is_valid_file(chunk_tokens_path(work_dir, i), min_size=2)
+        for i in range(chunk_count)
+    )
+
+    if all_chunks_done:
+        print("All chunks already processed, skip model loading and chunk processing")
+    elif args.parallel_first_two_only:
         print(f"Loading ASR model: {args.asr_model}")
         asr_model = load(args.asr_model)
 
@@ -332,11 +348,17 @@ def main() -> None:
         return
 
     if args.workers == 1:
-        print(f"Loading ASR model: {args.asr_model}")
-        asr_model = load(args.asr_model)
+        asr_model = None
+        align_model = None
 
-        print(f"Loading ForcedAligner model: {args.align_model}")
-        align_model = load(args.align_model)
+        def _ensure_models():
+            nonlocal asr_model, align_model
+            if asr_model is not None:
+                return
+            print(f"Loading ASR model: {args.asr_model}")
+            asr_model = load(args.asr_model)
+            print(f"Loading ForcedAligner model: {args.align_model}")
+            align_model = load(args.align_model)
 
         print("Process chunks sequentially with workers=1")
 
@@ -352,6 +374,7 @@ def main() -> None:
                 print(f"Reuse completed chunk task: {srt_path.name}")
                 completed_chunks.add(chunk_index)
             else:
+                _ensure_models()
                 try:
                     _, tokens = process_chunk_if_needed(
                         asr_model=asr_model,
@@ -403,11 +426,17 @@ def main() -> None:
         worker_chunks: List[List[Tuple[int, Path, float]]] = [chunks[0::2], chunks[1::2]]
 
         def run_worker(worker_id: int, assigned_chunks: List[Tuple[int, Path, float]]) -> List[int]:
-            print(f"Worker {worker_id}: loading ASR model: {args.asr_model}")
-            worker_asr_model = load(args.asr_model)
+            worker_asr_model = None
+            worker_align_model = None
 
-            print(f"Worker {worker_id}: loading ForcedAligner model: {args.align_model}")
-            worker_align_model = load(args.align_model)
+            def _ensure_worker_models():
+                nonlocal worker_asr_model, worker_align_model
+                if worker_asr_model is not None:
+                    return
+                print(f"Worker {worker_id}: loading ASR model: {args.asr_model}")
+                worker_asr_model = load(args.asr_model)
+                print(f"Worker {worker_id}: loading ForcedAligner model: {args.align_model}")
+                worker_align_model = load(args.align_model)
 
             finished: List[int] = []
             try:
@@ -424,6 +453,7 @@ def main() -> None:
                         if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
                             print(f"Worker {worker_id}: reuse completed chunk task: {srt_path.name}")
                         else:
+                            _ensure_worker_models()
                             _, tokens = process_chunk_if_needed(
                                 asr_model=worker_asr_model,
                                 align_model=worker_align_model,
@@ -452,8 +482,10 @@ def main() -> None:
                     finally:
                         cleanup_after_inference()
             finally:
-                del worker_asr_model
-                del worker_align_model
+                if worker_asr_model is not None:
+                    del worker_asr_model
+                if worker_align_model is not None:
+                    del worker_align_model
                 cleanup_after_inference()
 
             return finished
@@ -487,17 +519,30 @@ def main() -> None:
                 )
 
     cleanup_after_inference()
-    all_tokens = load_all_cached_tokens(work_dir, chunk_count)
-    save_tokens(all_tokens, final_tokens_path(work_dir))
 
-    subtitles = build_subtitles(
-        all_tokens,
-        max_chars=args.max_chars,
-        max_duration=args.max_duration,
-        pause_threshold=args.pause_threshold,
-    )
+    # Merge tokens cache
+    all_tokens_path = final_tokens_path(work_dir)
+    if is_valid_file(all_tokens_path, min_size=2):
+        print(f"Reuse cached all tokens: {all_tokens_path.name}")
+    else:
+        all_tokens = load_all_cached_tokens(work_dir, chunk_count)
+        save_tokens(all_tokens, all_tokens_path)
 
-    write_srt(subtitles, output_path)
+    # Final SRT cache
+    if is_valid_file(output_path, min_size=1):
+        print(f"Reuse existing final SRT: {output_path}")
+    else:
+        # 新策略：直接拼接 chunk SRT，不重新断句
+        merge_chunk_srts_to_final(work_dir, chunk_count, output_path)
+
+    # 旧策略：从所有 token 重新断句（已弃用，保留供回撤）
+    # subtitles = build_subtitles(
+    #     all_tokens,
+    #     max_chars=args.max_chars,
+    #     max_duration=args.max_duration,
+    #     pause_threshold=args.pause_threshold,
+    # )
+    # write_srt(subtitles, output_path)
 
     transcript_path = output_path.with_suffix(".txt")
     write_all_transcripts(work_dir, chunk_count, transcript_path)
