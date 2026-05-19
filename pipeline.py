@@ -195,10 +195,14 @@ def merge_chunk_srts_to_final(
     work_dir: Path,
     chunk_count: int,
     output_path: Path,
+    sub_display_delay: float = 0.5,
 ) -> None:
     """
     将所有 chunk SRT 直接拼接为最终 SRT（不重新断句）。
     按 chunk 顺序读取，按开始时间排序，重新编号后写入。
+
+    sub_display_delay: 每条字幕结束时间向后延长的秒数，
+                       但不超过下一条字幕的开始时间。
     """
     all_entries: List[Tuple[float, float, str]] = []
 
@@ -214,6 +218,14 @@ def merge_chunk_srts_to_final(
 
     # Sort by start time (safety measure, chunks should already be in order)
     all_entries.sort(key=lambda e: (e[0], e[1]))
+
+    # Apply display delay: extend end time, clamped to next subtitle's start
+    if sub_display_delay > 0:
+        for i in range(len(all_entries)):
+            start, end, sub_text = all_entries[i]
+            next_start = all_entries[i + 1][0] if i + 1 < len(all_entries) else float("inf")
+            new_end = min(end + sub_display_delay, next_start)
+            all_entries[i] = (start, new_end, sub_text)
 
     # Write final SRT with sequential numbering
     lines: List[str] = []

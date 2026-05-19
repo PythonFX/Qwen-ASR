@@ -102,6 +102,7 @@ def main() -> None:
     parser.add_argument("--vad-speech-pad-ms", type=int, default=300, help="VAD 语音段前后 padding ms（默认 300）")
     parser.add_argument("--vad-chunk-pad", type=float, default=1.0, help="VAD chunk 前后额外扩展秒数，给 ASR 更多上下文（默认 1.0）")
     parser.add_argument("--max-chunks", type=int, default=0, help="最多处理前 N 个 chunk，0 表示全部（用于调试）")
+    parser.add_argument("--sub-display-delay", type=float, default=0.5, help="字幕结束时间向后延长秒数（默认 0.5）")
 
     args = parser.parse_args()
 
@@ -533,7 +534,7 @@ def main() -> None:
         print(f"Reuse existing final SRT: {output_path}")
     else:
         # 新策略：直接拼接 chunk SRT，不重新断句
-        merge_chunk_srts_to_final(work_dir, chunk_count, output_path)
+        merge_chunk_srts_to_final(work_dir, chunk_count, output_path, sub_display_delay=args.sub_display_delay)
 
     # 旧策略：从所有 token 重新断句（已弃用，保留供回撤）
     # subtitles = build_subtitles(
