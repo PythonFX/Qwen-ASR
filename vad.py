@@ -18,8 +18,8 @@ def detect_speech_segments(
     vad_model,
     threshold: float = 0.5,
     min_speech_duration_ms: int = 250,
-    min_silence_duration_ms: int = 100,
-    speech_pad_ms: int = 30,
+    min_silence_duration_ms: int = 300,
+    speech_pad_ms: int = 300,
 ) -> List[SpeechSegment]:
     """Run Silero VAD on full audio, return speech segments in seconds."""
     from silero_vad import read_audio, get_speech_timestamps

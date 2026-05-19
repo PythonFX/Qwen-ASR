@@ -97,7 +97,9 @@ def main() -> None:
     parser.add_argument("--no-vad", action="store_true", help="禁用 VAD 感知切分，使用固定间隔切分")
     parser.add_argument("--vad-threshold", type=float, default=0.5, help="Silero VAD 语音概率阈值（默认 0.5）")
     parser.add_argument("--vad-min-speech-ms", type=int, default=250, help="最短语音片段 ms（默认 250）")
-    parser.add_argument("--vad-min-silence-ms", type=int, default=100, help="最短静音间隔 ms（默认 100）")
+    parser.add_argument("--vad-min-silence-ms", type=int, default=300, help="最短静音间隔 ms（默认 300）")
+    parser.add_argument("--vad-speech-pad-ms", type=int, default=300, help="VAD 语音段前后 padding ms（默认 300）")
+    parser.add_argument("--vad-chunk-pad", type=float, default=1.0, help="VAD chunk 前后额外扩展秒数，给 ASR 更多上下文（默认 1.0）")
 
     args = parser.parse_args()
 
@@ -174,6 +176,7 @@ def main() -> None:
                 threshold=args.vad_threshold,
                 min_speech_duration_ms=args.vad_min_speech_ms,
                 min_silence_duration_ms=args.vad_min_silence_ms,
+                speech_pad_ms=args.vad_speech_pad_ms,
             )
             print(f"VAD detected {len(all_speech_segments)} speech segments")
 
@@ -207,7 +210,7 @@ def main() -> None:
         else:
             chunk_start, chunk_end = speech_chunks[target_pos]
             speech_chunks_single = [(chunk_start, chunk_end)]
-            result = split_audio_vad_aware(full_wav, work_dir, speech_chunks_single)
+            result = split_audio_vad_aware(full_wav, work_dir, speech_chunks_single, pad_seconds=args.vad_chunk_pad)
             chunk_index, chunk_path, offset = result[0]
             speech_regions = _get_speech_regions_for_chunk(
                 all_speech_segments, chunk_start, chunk_end,
@@ -260,7 +263,7 @@ def main() -> None:
             max_duration=float(args.chunk_seconds),
         )
         print(f"VAD-aware chunking: {len(speech_chunks)} chunks")
-        chunks = split_audio_vad_aware(full_wav, work_dir, speech_chunks)
+        chunks = split_audio_vad_aware(full_wav, work_dir, speech_chunks, pad_seconds=args.vad_chunk_pad)
 
     # Build per-chunk speech regions for VAD mode
     if not args.no_vad:

@@ -208,6 +208,7 @@ def split_audio_vad_aware(
     audio_path: Path,
     work_dir: Path,
     speech_chunks: List[Tuple[float, float]],
+    pad_seconds: float = 1.0,
 ) -> List[Tuple[int, Path, float]]:
     """
     基于 VAD 检测的语音边界切分音频。
@@ -215,28 +216,36 @@ def split_audio_vad_aware(
     speech_chunks 是 merge_segments_into_chunks 的输出：
       [(start_seconds, end_seconds), ...]
 
+    pad_seconds: 每个 chunk 前后额外扩展的秒数，给 ASR 提供更多声学上下文。
+                 实际提取范围是 [start-pad, end+pad]，offset 对应调整，
+                 不影响最终 token 时间戳精度（clip_tokens_to_speech 会裁剪）。
+
     返回格式与 split_audio_if_needed 一致：
       [(chunk_index, chunk_path, chunk_start_offset), ...]
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    total_duration = get_audio_duration(audio_path)
+
     chunks: List[Tuple[int, Path, float]] = []
     missing_chunks: List[Tuple[int, int, Path, float, float]] = []
 
     for index, (start, end) in enumerate(speech_chunks):
-        duration = end - start
+        padded_start = max(0.0, start - pad_seconds)
+        padded_end = min(total_duration, end + pad_seconds)
+        duration = padded_end - padded_start
         wav_path = chunk_wav_path(work_dir, index)
-        chunks.append((index, wav_path, start))
+        chunks.append((index, wav_path, padded_start))
 
         if is_valid_file(wav_path, min_size=1024):
             print(f"Reuse existing chunk wav: {wav_path.name}")
         else:
-            missing_chunks.append((index, index, wav_path, start, duration))
+            missing_chunks.append((index, index, wav_path, padded_start, duration))
 
     if not missing_chunks:
         return chunks
 
-    print(f"Create {len(missing_chunks)} VAD-aware chunk wav files")
+    print(f"Create {len(missing_chunks)} VAD-aware chunk wav files (pad={pad_seconds}s)")
 
     def create_chunk_wav(info: Tuple[int, int, Path, float, float]) -> int:
         _, idx, wav_path, start, duration = info
