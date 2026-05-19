@@ -307,8 +307,7 @@ def clip_tokens_to_speech(
 
 
 def process_chunk_if_needed(
-    asr_model,
-    align_model,
+    engine,
     chunk_index: int,
     chunk_path: Path,
     offset: float,
@@ -318,9 +317,7 @@ def process_chunk_if_needed(
 ) -> Tuple[str, List[AlignToken]]:
     """
     如果 chunk_XXXX.tokens.json 已存在，则跳过 ASR + ForcedAligner。
-    否则执行：
-    - ASR，写 chunk_XXXX.txt
-    - ForcedAligner，写 chunk_XXXX.tokens.json
+    否则通过 ASR engine 执行转录和对齐。
     """
     txt_path = chunk_txt_path(work_dir, chunk_index)
     tokens_path = chunk_tokens_path(work_dir, chunk_index)
@@ -332,20 +329,16 @@ def process_chunk_if_needed(
         return transcript, cached_tokens
 
     print(f"\nASR chunk {chunk_index:04d}: {chunk_path.name}, offset={offset:.2f}s")
-    transcript = transcribe_chunk(asr_model, chunk_path, language)
+    transcript, tokens = engine.transcribe_and_align(chunk_path, language, offset)
     txt_path.write_text(transcript, encoding="utf-8")
 
     print("Transcript:")
     print(transcript[:500] + ("..." if len(transcript) > 500 else ""))
 
     if not is_effective_transcript(transcript):
-        print(f"No effective transcript, skip align. transcript={transcript!r}")
+        print(f"No effective transcript, skip. transcript={transcript!r}")
         save_tokens([], tokens_path)
         return transcript, []
-
-    print(f"Forced alignment chunk {chunk_index:04d}")
-    tokens = align_chunk(align_model, chunk_path, transcript, language, offset=offset)
-    tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
 
     print(f"Aligned tokens: {len(tokens)}")
 

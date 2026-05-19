@@ -26,8 +26,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
 
-from config import ASR_MODEL_PATH, ALIGN_MODEL_PATH, SpeechSegment
+from config import ASR_MODEL_PATH, ALIGN_MODEL_PATH, PARAKEET_MODEL_PATH, ASREngineType, SpeechSegment
 from utils import require_ffmpeg, cleanup_after_inference, is_valid_file, remove_files
+from asr_engine import create_engine
 from audio import (
     video_stem_paths,
     extract_audio_if_needed,
@@ -78,8 +79,11 @@ def main() -> None:
     parser.add_argument("video", help="输入视频路径，例如 input.mp4")
     parser.add_argument("-o", "--output", help="输出 SRT 路径，默认和视频同名 .srt")
     parser.add_argument("--language", default="Japanese", help="语言，例如 Chinese / English / Japanese / Cantonese")
+    parser.add_argument("--asr-engine", default="qwen", choices=[e.value for e in ASREngineType],
+                        help="ASR 引擎类型：qwen（Qwen3-ASR + ForcedAligner）/ parakeet（parakeet-mlx，自带对齐）")
     parser.add_argument("--asr-model", default=ASR_MODEL_PATH)
     parser.add_argument("--align-model", default=ALIGN_MODEL_PATH)
+    parser.add_argument("--parakeet-model", default=PARAKEET_MODEL_PATH)
     parser.add_argument("--chunk-seconds", type=int, default=60)
     parser.add_argument("--part-chunks", type=int, default=10, help="每多少个 chunks 生成一个中间 part srt")
     parser.add_argument("--workers", type=int, default=2, help="worker 数量，只支持 1 或 2。默认 2；workers=2 时每个线程单独加载一套模型")
@@ -149,7 +153,7 @@ def main() -> None:
 
     extract_audio_if_needed(video_path, full_wav)
 
-    from mlx_audio.stt import load
+    engine_type = ASREngineType(args.asr_engine)
 
     # --- VAD pipeline ---
     all_speech_segments: List[SpeechSegment] = []
@@ -222,16 +226,16 @@ def main() -> None:
         print(
             f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
 
-        print(f"Loading ASR model: {args.asr_model}")
-        asr_model = load(args.asr_model)
-
-        print(f"Loading ForcedAligner model: {args.align_model}")
-        align_model = load(args.align_model)
+        engine = create_engine(
+            engine_type,
+            asr_model_path=args.asr_model,
+            align_model_path=args.align_model,
+            parakeet_model_path=args.parakeet_model,
+        )
 
         try:
             _, tokens = process_chunk_if_needed(
-                asr_model=asr_model,
-                align_model=align_model,
+                engine=engine,
                 chunk_index=chunk_index,
                 chunk_path=chunk_path,
                 offset=offset,
@@ -298,11 +302,12 @@ def main() -> None:
     if all_chunks_done:
         print("All chunks already processed, skip model loading and chunk processing")
     elif args.parallel_first_two_only:
-        print(f"Loading ASR model: {args.asr_model}")
-        asr_model = load(args.asr_model)
-
-        print(f"Loading ForcedAligner model: {args.align_model}")
-        align_model = load(args.align_model)
+        engine = create_engine(
+            engine_type,
+            asr_model_path=args.asr_model,
+            align_model_path=args.align_model,
+            parakeet_model_path=args.parakeet_model,
+        )
         print("DEBUG MODE: --parallel-first-two-only is enabled. Only chunk 0000 and 0001 will run sequentially, then the program exits.")
         print("Note: MLX GPU inference is thread-bound here; Python thread parallelism is disabled to avoid `There is no Stream(gpu, 1) in current thread`.")
         test_chunks = chunks[:2]
@@ -319,8 +324,7 @@ def main() -> None:
                     print(f"DEBUG reuse completed chunk task: {srt_path.name}")
                 else:
                     _, tokens = process_chunk_if_needed(
-                        asr_model=asr_model,
-                        align_model=align_model,
+                        engine=engine,
                         chunk_index=chunk_index,
                         chunk_path=chunk_path,
                         offset=offset,
@@ -349,17 +353,18 @@ def main() -> None:
         return
 
     if args.workers == 1:
-        asr_model = None
-        align_model = None
+        engine = None
 
-        def _ensure_models():
-            nonlocal asr_model, align_model
-            if asr_model is not None:
+        def _ensure_engine():
+            nonlocal engine
+            if engine is not None:
                 return
-            print(f"Loading ASR model: {args.asr_model}")
-            asr_model = load(args.asr_model)
-            print(f"Loading ForcedAligner model: {args.align_model}")
-            align_model = load(args.align_model)
+            engine = create_engine(
+                engine_type,
+                asr_model_path=args.asr_model,
+                align_model_path=args.align_model,
+                parakeet_model_path=args.parakeet_model,
+            )
 
         print("Process chunks sequentially with workers=1")
 
@@ -375,11 +380,10 @@ def main() -> None:
                 print(f"Reuse completed chunk task: {srt_path.name}")
                 completed_chunks.add(chunk_index)
             else:
-                _ensure_models()
+                _ensure_engine()
                 try:
                     _, tokens = process_chunk_if_needed(
-                        asr_model=asr_model,
-                        align_model=align_model,
+                        engine=engine,
                         chunk_index=chunk_index,
                         chunk_path=chunk_path,
                         offset=offset,
@@ -421,23 +425,25 @@ def main() -> None:
                 )
 
     else:
-        print("Process chunks with workers=2. Each worker thread loads its own ASR and ForcedAligner models.")
+        print("Process chunks with workers=2. Each worker thread loads its own engine.")
         print("Note: this avoids sharing MLX GPU streams across threads, but roughly doubles model memory usage.")
 
         worker_chunks: List[List[Tuple[int, Path, float]]] = [chunks[0::2], chunks[1::2]]
 
         def run_worker(worker_id: int, assigned_chunks: List[Tuple[int, Path, float]]) -> List[int]:
-            worker_asr_model = None
-            worker_align_model = None
+            worker_engine = None
 
-            def _ensure_worker_models():
-                nonlocal worker_asr_model, worker_align_model
-                if worker_asr_model is not None:
+            def _ensure_worker_engine():
+                nonlocal worker_engine
+                if worker_engine is not None:
                     return
-                print(f"Worker {worker_id}: loading ASR model: {args.asr_model}")
-                worker_asr_model = load(args.asr_model)
-                print(f"Worker {worker_id}: loading ForcedAligner model: {args.align_model}")
-                worker_align_model = load(args.align_model)
+                print(f"Worker {worker_id}: creating {engine_type.value} engine...")
+                worker_engine = create_engine(
+                    engine_type,
+                    asr_model_path=args.asr_model,
+                    align_model_path=args.align_model,
+                    parakeet_model_path=args.parakeet_model,
+                )
 
             finished: List[int] = []
             try:
@@ -454,10 +460,9 @@ def main() -> None:
                         if is_valid_file(srt_path, min_size=0) and is_valid_file(tokens_path, min_size=2):
                             print(f"Worker {worker_id}: reuse completed chunk task: {srt_path.name}")
                         else:
-                            _ensure_worker_models()
+                            _ensure_worker_engine()
                             _, tokens = process_chunk_if_needed(
-                                asr_model=worker_asr_model,
-                                align_model=worker_align_model,
+                                engine=worker_engine,
                                 chunk_index=chunk_index,
                                 chunk_path=chunk_path,
                                 offset=offset,
@@ -483,10 +488,8 @@ def main() -> None:
                     finally:
                         cleanup_after_inference()
             finally:
-                if worker_asr_model is not None:
-                    del worker_asr_model
-                if worker_align_model is not None:
-                    del worker_align_model
+                if worker_engine is not None:
+                    del worker_engine
                 cleanup_after_inference()
 
             return finished
