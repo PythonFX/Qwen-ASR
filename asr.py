@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -9,6 +10,8 @@ from typing import Iterable, List, Optional, Tuple
 from config import AlignToken, SpeechSegment
 from utils import is_valid_file
 from audio import chunk_txt_path, chunk_tokens_path
+
+_align_lock = threading.Lock()
 
 
 def normalize_transcript(text: str) -> str:
@@ -110,11 +113,12 @@ def align_chunk(align_model, chunk_path: Path, transcript: str, language: str, o
     if not is_effective_transcript(transcript):
         return []
 
-    result = align_model.generate(
-        audio=str(chunk_path),
-        text=transcript,
-        language=language,
-    )
+    with _align_lock:
+        result = align_model.generate(
+            audio=str(chunk_path),
+            text=transcript,
+            language=language,
+        )
 
     tokens: List[AlignToken] = []
     for item in iter_align_items(result):
