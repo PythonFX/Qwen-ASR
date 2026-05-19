@@ -26,13 +26,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
 
-from config import ASR_MODEL_PATH, ALIGN_MODEL_PATH
+from config import ASR_MODEL_PATH, ALIGN_MODEL_PATH, SpeechSegment
 from utils import require_ffmpeg, cleanup_after_inference, is_valid_file, remove_files
 from audio import (
     video_stem_paths,
     extract_audio_if_needed,
     get_chunk_count,
     split_audio_if_needed,
+    split_audio_vad_aware,
     create_single_chunk_wav_if_needed,
     chunk_srt_path,
     chunk_tokens_path,
@@ -46,6 +47,29 @@ from pipeline import (
     load_all_cached_tokens,
     write_all_transcripts,
 )
+
+
+def _remove_vad_cache(work_dir: Path) -> None:
+    from vad import vad_cache_path
+    cache = vad_cache_path(work_dir)
+    if cache.exists():
+        print(f"Remove VAD cache: {cache.name}")
+        cache.unlink()
+
+
+def _get_speech_regions_for_chunk(
+    all_segments: List[SpeechSegment],
+    chunk_start: float,
+    chunk_end: float,
+) -> List[SpeechSegment]:
+    return [
+        SpeechSegment(
+            start=max(seg.start, chunk_start),
+            end=min(seg.end, chunk_end),
+        )
+        for seg in all_segments
+        if seg.end > chunk_start and seg.start < chunk_end
+    ]
 
 
 def main() -> None:
@@ -69,6 +93,11 @@ def main() -> None:
     parser.add_argument("--force-srt", action="store_true", help="强制重新生成所有 srt（不重新跑 ASR，仅从已有 tokens 重新断句）")
     parser.add_argument("--parallel-first-two-only", action="store_true", help="只并行处理前两个 chunk，然后退出（用于调试）")
     parser.add_argument("--only-chunk-srt", nargs="?", const=1, type=int, help="只生成第 i 个 chunk 的 SRT；i 从 1 开始。不传 i 时默认 1")
+
+    parser.add_argument("--no-vad", action="store_true", help="禁用 VAD 感知切分，使用固定间隔切分")
+    parser.add_argument("--vad-threshold", type=float, default=0.5, help="Silero VAD 语音概率阈值（默认 0.5）")
+    parser.add_argument("--vad-min-speech-ms", type=int, default=250, help="最短语音片段 ms（默认 250）")
+    parser.add_argument("--vad-min-silence-ms", type=int, default=100, help="最短静音间隔 ms（默认 100）")
 
     args = parser.parse_args()
 
@@ -101,9 +130,11 @@ def main() -> None:
 
     if args.force_chunks:
         remove_files(["chunk_*.wav"], work_dir)
+        _remove_vad_cache(work_dir)
 
     if args.force_asr:
         remove_files(["chunk_*.txt", "chunk_*.tokens.json", "chunk_*.srt", "all.tokens.json", "part_*.srt"], work_dir)
+        _remove_vad_cache(work_dir)
 
     if args.force_parts:
         remove_files(["chunk_*.srt", "part_*.srt"], work_dir)
@@ -115,20 +146,72 @@ def main() -> None:
 
     from mlx_audio.stt import load
 
+    # --- VAD pipeline ---
+    all_speech_segments: List[SpeechSegment] = []
+    if not args.no_vad:
+        from vad import (
+            load_vad_model,
+            detect_speech_segments,
+            merge_segments_into_chunks,
+            vad_cache_path,
+            save_vad_segments,
+            load_vad_segments_if_valid,
+        )
+
+        vad_cache = vad_cache_path(work_dir)
+        cached_segments = load_vad_segments_if_valid(vad_cache)
+
+        if cached_segments is not None:
+            print(f"Reuse cached VAD segments: {vad_cache.name} ({len(cached_segments)} segments)")
+            all_speech_segments = cached_segments
+        else:
+            print("Loading Silero VAD model...")
+            vad_model = load_vad_model()
+
+            print(f"Running VAD on full audio: {full_wav.name}")
+            all_speech_segments = detect_speech_segments(
+                full_wav, vad_model,
+                threshold=args.vad_threshold,
+                min_speech_duration_ms=args.vad_min_speech_ms,
+                min_silence_duration_ms=args.vad_min_silence_ms,
+            )
+            print(f"VAD detected {len(all_speech_segments)} speech segments")
+
+            save_vad_segments(all_speech_segments, vad_cache)
+            print(f"Saved VAD segments cache: {vad_cache.name}")
+
     if args.only_chunk_srt is not None:
         target_pos = args.only_chunk_srt - 1
-        total_chunks = get_chunk_count(full_wav, args.chunk_seconds)
+
+        if args.no_vad:
+            total_chunks = get_chunk_count(full_wav, args.chunk_seconds)
+        else:
+            speech_chunks = merge_segments_into_chunks(
+                all_speech_segments,
+                max_duration=float(args.chunk_seconds),
+            )
+            total_chunks = len(speech_chunks)
 
         if target_pos >= total_chunks:
             raise ValueError(f"--only-chunk-srt={args.only_chunk_srt} 超出范围；当前共有 {total_chunks} 个 chunks")
 
-        chunk_index, chunk_path, offset = create_single_chunk_wav_if_needed(
-            audio_path=full_wav,
-            work_dir=work_dir,
-            chunk_index=target_pos,
-            chunk_seconds=args.chunk_seconds,
-            force=args.force_chunks,
-        )
+        if args.no_vad:
+            chunk_index, chunk_path, offset = create_single_chunk_wav_if_needed(
+                audio_path=full_wav,
+                work_dir=work_dir,
+                chunk_index=target_pos,
+                chunk_seconds=args.chunk_seconds,
+                force=args.force_chunks,
+            )
+            speech_regions = None
+        else:
+            chunk_start, chunk_end = speech_chunks[target_pos]
+            speech_chunks_single = [(chunk_start, chunk_end)]
+            result = split_audio_vad_aware(full_wav, work_dir, speech_chunks_single)
+            chunk_index, chunk_path, offset = result[0]
+            speech_regions = _get_speech_regions_for_chunk(
+                all_speech_segments, chunk_start, chunk_end,
+            )
 
         print(
             f"ONLY CHUNK SRT MODE: generate only chunk {args.only_chunk_srt} -> {chunk_srt_path(work_dir, chunk_index)}")
@@ -148,6 +231,7 @@ def main() -> None:
                 offset=offset,
                 language=args.language,
                 work_dir=work_dir,
+                speech_regions=speech_regions,
             )
             srt_path = write_chunk_srt_if_needed(
                 work_dir=work_dir,
@@ -163,11 +247,30 @@ def main() -> None:
         print(f"ONLY CHUNK SRT DONE: {srt_path}")
         return
 
-    chunks = split_audio_if_needed(
-        full_wav,
-        work_dir,
-        chunk_seconds=args.chunk_seconds,
-    )
+    # --- Chunk audio ---
+    if args.no_vad:
+        chunks = split_audio_if_needed(
+            full_wav,
+            work_dir,
+            chunk_seconds=args.chunk_seconds,
+        )
+    else:
+        speech_chunks = merge_segments_into_chunks(
+            all_speech_segments,
+            max_duration=float(args.chunk_seconds),
+        )
+        print(f"VAD-aware chunking: {len(speech_chunks)} chunks")
+        chunks = split_audio_vad_aware(full_wav, work_dir, speech_chunks)
+
+    # Build per-chunk speech regions for VAD mode
+    if not args.no_vad:
+        chunk_speech_map: dict = {}
+        for idx, (chunk_start, chunk_end) in enumerate(speech_chunks):
+            chunk_speech_map[idx] = _get_speech_regions_for_chunk(
+                all_speech_segments, chunk_start, chunk_end,
+            )
+    else:
+        chunk_speech_map = {}
 
     chunk_count = len(chunks)
 
@@ -203,6 +306,7 @@ def main() -> None:
                         offset=offset,
                         language=args.language,
                         work_dir=work_dir,
+                        speech_regions=chunk_speech_map.get(chunk_index),
                     )
                     write_chunk_srt_if_needed(
                         work_dir=work_dir,
@@ -254,6 +358,7 @@ def main() -> None:
                         offset=offset,
                         language=args.language,
                         work_dir=work_dir,
+                        speech_regions=chunk_speech_map.get(chunk_index),
                     )
 
                     write_chunk_srt_if_needed(
@@ -324,6 +429,7 @@ def main() -> None:
                                 offset=offset,
                                 language=args.language,
                                 work_dir=work_dir,
+                                speech_regions=chunk_speech_map.get(chunk_index),
                             )
 
                             write_chunk_srt_if_needed(

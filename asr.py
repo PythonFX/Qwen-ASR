@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from config import AlignToken
+from config import AlignToken, SpeechSegment
 from utils import is_valid_file
 from audio import chunk_txt_path, chunk_tokens_path
 
@@ -245,6 +245,63 @@ def fix_abnormal_token_durations(tokens: List[AlignToken]) -> List[AlignToken]:
     return fixed
 
 
+def clip_tokens_to_speech(
+    tokens: List[AlignToken],
+    speech_regions: List[SpeechSegment],
+) -> List[AlignToken]:
+    """
+    将 token 时间戳裁剪到 VAD 检测的语音区域内。
+
+    对于每个 token：
+    - 如果 token.start 落在静音区域，移到下一个语音区域的起始
+    - 如果 token.end 落在静音区域，移到上一个语音区域的结束
+    - 如果 token 完全不在任何语音区域内，丢弃
+    """
+    if not tokens or not speech_regions:
+        return tokens
+
+    clipped = []
+    for tok in tokens:
+        best_start = tok.start
+        best_end = tok.end
+
+        if tok.start < speech_regions[0].start:
+            best_start = speech_regions[0].start
+        if tok.end > speech_regions[-1].end:
+            best_end = speech_regions[-1].end
+
+        for i, region in enumerate(speech_regions):
+            if region.start <= tok.start <= region.end:
+                best_start = tok.start
+                break
+            if i + 1 < len(speech_regions):
+                next_region = speech_regions[i + 1]
+                if region.end < tok.start < next_region.start:
+                    best_start = next_region.start
+                    break
+
+        for i in range(len(speech_regions) - 1, -1, -1):
+            region = speech_regions[i]
+            if region.start <= tok.end <= region.end:
+                best_end = tok.end
+                break
+            if i > 0:
+                prev_region = speech_regions[i - 1]
+                if prev_region.end < tok.end < region.start:
+                    best_end = prev_region.end
+                    break
+
+        if best_end <= best_start:
+            continue
+
+        if best_start != tok.start or best_end != tok.end:
+            clipped.append(AlignToken(text=tok.text, start=best_start, end=best_end))
+        else:
+            clipped.append(tok)
+
+    return clipped
+
+
 def process_chunk_if_needed(
     asr_model,
     align_model,
@@ -253,6 +310,7 @@ def process_chunk_if_needed(
     offset: float,
     language: str,
     work_dir: Path,
+    speech_regions: Optional[List[SpeechSegment]] = None,
 ) -> Tuple[str, List[AlignToken]]:
     """
     如果 chunk_XXXX.tokens.json 已存在，则跳过 ASR + ForcedAligner。
@@ -284,6 +342,14 @@ def process_chunk_if_needed(
     print(f"Forced alignment chunk {chunk_index:04d}")
     tokens = align_chunk(align_model, chunk_path, transcript, language, offset=offset)
     tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
+
+    if speech_regions:
+        before_count = len(tokens)
+        tokens = clip_tokens_to_speech(tokens, speech_regions)
+        clipped_count = before_count - len(tokens)
+        if clipped_count > 0:
+            print(f"Clipped {clipped_count} tokens outside speech regions")
+
     print(f"Aligned tokens: {len(tokens)}")
 
     save_tokens(tokens, tokens_path)

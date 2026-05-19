@@ -202,3 +202,62 @@ def create_single_chunk_wav_if_needed(
         ])
 
     return chunk_index, wav_path, start
+
+
+def split_audio_vad_aware(
+    audio_path: Path,
+    work_dir: Path,
+    speech_chunks: List[Tuple[float, float]],
+) -> List[Tuple[int, Path, float]]:
+    """
+    基于 VAD 检测的语音边界切分音频。
+
+    speech_chunks 是 merge_segments_into_chunks 的输出：
+      [(start_seconds, end_seconds), ...]
+
+    返回格式与 split_audio_if_needed 一致：
+      [(chunk_index, chunk_path, chunk_start_offset), ...]
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks: List[Tuple[int, Path, float]] = []
+    missing_chunks: List[Tuple[int, int, Path, float, float]] = []
+
+    for index, (start, end) in enumerate(speech_chunks):
+        duration = end - start
+        wav_path = chunk_wav_path(work_dir, index)
+        chunks.append((index, wav_path, start))
+
+        if is_valid_file(wav_path, min_size=1024):
+            print(f"Reuse existing chunk wav: {wav_path.name}")
+        else:
+            missing_chunks.append((index, index, wav_path, start, duration))
+
+    if not missing_chunks:
+        return chunks
+
+    print(f"Create {len(missing_chunks)} VAD-aware chunk wav files")
+
+    def create_chunk_wav(info: Tuple[int, int, Path, float, float]) -> int:
+        _, idx, wav_path, start, duration = info
+        print(f"Create chunk wav: {wav_path.name}, offset={start:.2f}s, duration={duration:.2f}s")
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", str(audio_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            str(wav_path),
+        ])
+        return idx
+
+    with ThreadPoolExecutor(max_workers=min(5, len(missing_chunks))) as executor:
+        futures = [executor.submit(create_chunk_wav, info) for info in missing_chunks]
+        for future in as_completed(futures):
+            finished_index = future.result()
+            print(f"Finished creating chunk wav: chunk_{finished_index:04d}.wav")
+
+    return chunks

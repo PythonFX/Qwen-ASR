@@ -2,3 +2,4 @@ nagisa
 qwen-asr
 torch
 torchaudio
+silero-vad

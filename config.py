@@ -15,6 +15,12 @@ class AlignToken:
 
 
 @dataclass
+class SpeechSegment:
+    start: float
+    end: float
+
+
+@dataclass
 class Subtitle:
     start: float
     end: float
