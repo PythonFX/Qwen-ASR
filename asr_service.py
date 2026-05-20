@@ -122,7 +122,7 @@ class ASRService:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         *,
         language: str = "Japanese",
-        engine_type: ASREngineType = ASREngineType.PARAKEET,
+        engine_type: ASREngineType | str = ASREngineType.PARAKEET,
         workers: int = 1,
         chunk_seconds: int = 60,
         part_chunks: int = 10,
@@ -131,6 +131,8 @@ class ASRService:
         pause_threshold: float = 0.65,
         no_vad: bool = False,
         sub_display_delay: float = 0.5,
+        aligner: str = "qwen",
+        keep_middle: bool = False,
     ) -> None:
         """Run the full ASR -> SRT pipeline with progress reporting.
 
@@ -138,6 +140,9 @@ class ASRService:
         """
         self._cancel_requested = False
         _cb = progress_callback or (lambda _s, _p: None)
+
+        if isinstance(engine_type, str):
+            engine_type = ASREngineType(engine_type)
 
         require_ffmpeg()
         video_path = Path(video_path).expanduser().resolve()
@@ -220,71 +225,24 @@ class ASRService:
 
         # 4. Process chunks  (20-95 %)
         if not all_done:
-            engine = None
+            _engine_kw = dict(
+                asr_model_path=ASR_MODEL_PATH,
+                align_model_path=ALIGN_MODEL_PATH if aligner != "none" else None,
+                parakeet_model_path=PARAKEET_MODEL_PATH,
+            )
 
-            def _ensure_engine():
-                nonlocal engine
-                if engine is None:
-                    engine = create_engine(
-                        engine_type,
-                        asr_model_path=ASR_MODEL_PATH,
-                        align_model_path=ALIGN_MODEL_PATH,
-                        parakeet_model_path=PARAKEET_MODEL_PATH,
-                    )
-
-            completed: set = set()
-
-            for done_count, (ci, cpath, offset) in enumerate(chunks):
-                if self._cancel_requested:
-                    _cb("已取消", 0)
-                    return
-
-                pct = 20 + (done_count / chunk_count) * 75
-                _cb(f"处理字幕 [{done_count + 1}/{chunk_count}]", pct)
-
-                srt_p = chunk_srt_path(work_dir, ci)
-                tok_p = chunk_tokens_path(work_dir, ci)
-
-                if is_valid_file(srt_p, min_size=0) and is_valid_file(
-                    tok_p, min_size=2
-                ):
-                    completed.add(ci)
-                else:
-                    _ensure_engine()
-                    try:
-                        _, tokens = process_chunk_if_needed(
-                            engine=engine,
-                            chunk_index=ci,
-                            chunk_path=cpath,
-                            offset=offset,
-                            language=language,
-                            work_dir=work_dir,
-                            speech_regions=chunk_speech_map.get(ci),
-                        )
-                        write_chunk_srt_if_needed(
-                            work_dir=work_dir,
-                            chunk_index=ci,
-                            tokens=tokens,
-                            max_chars=max_chars,
-                            max_duration=max_duration,
-                            pause_threshold=pause_threshold,
-                        )
-                        completed.add(ci)
-                    finally:
-                        cleanup_after_inference()
-
-                # Write part-SRT when a group is complete
-                gs = (ci // part_chunks) * part_chunks
-                ge = min(gs + part_chunks - 1, chunk_count - 1)
-                if all(i in completed for i in range(gs, ge + 1)):
-                    build_and_write_part_srt_if_needed(
-                        work_dir=work_dir,
-                        chunk_start=gs,
-                        chunk_end=ge,
-                        max_chars=max_chars,
-                        max_duration=max_duration,
-                        pause_threshold=pause_threshold,
-                    )
+            if workers == 1:
+                self._process_chunks_sequential(
+                    chunks, chunk_count, work_dir, engine_type, language,
+                    chunk_speech_map, part_chunks, max_chars, max_duration,
+                    pause_threshold, _engine_kw, _cb,
+                )
+            else:
+                self._process_chunks_parallel(
+                    chunks, chunk_count, work_dir, engine_type, language,
+                    chunk_speech_map, part_chunks, max_chars, max_duration,
+                    pause_threshold, _engine_kw, _cb,
+                )
 
         # 5. Merge  (95-100 %)
         _cb("合并字幕", 96)
@@ -305,9 +263,147 @@ class ASRService:
         transcript_path = output_path.with_suffix(".txt")
         write_all_transcripts(work_dir, chunk_count, transcript_path)
 
-        # 6. Cleanup work dir (keep mono wav)
-        if work_dir.exists():
+        # 6. Cleanup work dir (keep wav/vad cache, delete the rest)
+        if not keep_middle and work_dir.exists():
             import shutil
-            shutil.rmtree(work_dir, ignore_errors=True)
+            for f in work_dir.iterdir():
+                if f.suffix == ".wav" or f.name == "vad_segments.json":
+                    continue
+                if f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+                else:
+                    f.unlink(missing_ok=True)
 
         _cb("完成", 100)
+
+    # ------------------------------------------------------------------
+    # Chunk processing helpers
+    # ------------------------------------------------------------------
+
+    def _process_chunks_sequential(
+        self, chunks, chunk_count, work_dir, engine_type, language,
+        chunk_speech_map, part_chunks, max_chars, max_duration,
+        pause_threshold, engine_kw, _cb,
+    ) -> None:
+        engine = None
+
+        def _ensure_engine():
+            nonlocal engine
+            if engine is None:
+                engine = create_engine(engine_type, **engine_kw)
+
+        completed: set = set()
+
+        for done_count, (ci, cpath, offset) in enumerate(chunks):
+            if self._cancel_requested:
+                _cb("已取消", 0)
+                return
+
+            pct = 20 + (done_count / chunk_count) * 75
+            _cb(f"处理字幕 [{done_count + 1}/{chunk_count}]", pct)
+
+            srt_p = chunk_srt_path(work_dir, ci)
+            tok_p = chunk_tokens_path(work_dir, ci)
+
+            if is_valid_file(srt_p, min_size=0) and is_valid_file(
+                tok_p, min_size=2
+            ):
+                completed.add(ci)
+            else:
+                _ensure_engine()
+                try:
+                    _, tokens = process_chunk_if_needed(
+                        engine=engine, chunk_index=ci, chunk_path=cpath,
+                        offset=offset, language=language, work_dir=work_dir,
+                        speech_regions=chunk_speech_map.get(ci),
+                    )
+                    write_chunk_srt_if_needed(
+                        work_dir=work_dir, chunk_index=ci, tokens=tokens,
+                        max_chars=max_chars, max_duration=max_duration,
+                        pause_threshold=pause_threshold,
+                    )
+                    completed.add(ci)
+                finally:
+                    cleanup_after_inference()
+
+            gs = (ci // part_chunks) * part_chunks
+            ge = min(gs + part_chunks - 1, chunk_count - 1)
+            if all(i in completed for i in range(gs, ge + 1)):
+                build_and_write_part_srt_if_needed(
+                    work_dir=work_dir, chunk_start=gs, chunk_end=ge,
+                    max_chars=max_chars, max_duration=max_duration,
+                    pause_threshold=pause_threshold,
+                )
+
+    def _process_chunks_parallel(
+        self, chunks, chunk_count, work_dir, engine_type, language,
+        chunk_speech_map, part_chunks, max_chars, max_duration,
+        pause_threshold, engine_kw, _cb,
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        worker_chunks = [chunks[0::2], chunks[1::2]]
+        completed: set = set()
+        done_counter = [0]
+        lock = threading.Lock()
+
+        def run_worker(assigned_chunks):
+            worker_engine = None
+
+            def _ensure():
+                nonlocal worker_engine
+                if worker_engine is None:
+                    worker_engine = create_engine(engine_type, **engine_kw)
+
+            for ci, cpath, offset in assigned_chunks:
+                if self._cancel_requested:
+                    return
+
+                srt_p = chunk_srt_path(work_dir, ci)
+                tok_p = chunk_tokens_path(work_dir, ci)
+
+                if is_valid_file(srt_p, min_size=0) and is_valid_file(
+                    tok_p, min_size=2
+                ):
+                    pass
+                else:
+                    _ensure()
+                    try:
+                        _, tokens = process_chunk_if_needed(
+                            engine=worker_engine, chunk_index=ci,
+                            chunk_path=cpath, offset=offset,
+                            language=language, work_dir=work_dir,
+                            speech_regions=chunk_speech_map.get(ci),
+                        )
+                        write_chunk_srt_if_needed(
+                            work_dir=work_dir, chunk_index=ci, tokens=tokens,
+                            max_chars=max_chars, max_duration=max_duration,
+                            pause_threshold=pause_threshold,
+                        )
+                    finally:
+                        cleanup_after_inference()
+
+                with lock:
+                    done_counter[0] += 1
+                    n = done_counter[0]
+                    completed.add(ci)
+                _cb(f"处理字幕 [{n}/{chunk_count}]", 20 + (n / chunk_count) * 75)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(run_worker, assigned)
+                for assigned in worker_chunks if assigned
+            ]
+            for future in as_completed(futures):
+                future.result()
+
+        # Build part SRTs for completed groups
+        for gs in range(0, chunk_count, part_chunks):
+            ge = min(gs + part_chunks - 1, chunk_count - 1)
+            if all(i in completed for i in range(gs, ge + 1)):
+                build_and_write_part_srt_if_needed(
+                    work_dir=work_dir, chunk_start=gs, chunk_end=ge,
+                    max_chars=max_chars, max_duration=max_duration,
+                    pause_threshold=pause_threshold,
+                )

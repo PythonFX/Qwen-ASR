@@ -107,8 +107,15 @@ def main() -> None:
     parser.add_argument("--vad-chunk-pad", type=float, default=1.0, help="VAD chunk 前后额外扩展秒数，给 ASR 更多上下文（默认 1.0）")
     parser.add_argument("--max-chunks", type=int, default=0, help="最多处理前 N 个 chunk，0 表示全部（用于调试）")
     parser.add_argument("--sub-display-delay", type=float, default=0.5, help="字幕结束时间向后延长秒数（默认 0.5）")
+    parser.add_argument("--aligner", default="qwen", choices=["qwen", "none"],
+                        help="时间戳对齐方式：qwen（Qwen ForcedAligner，默认）/ none（ASR 内置时间戳）")
+    parser.add_argument("--keep-middle", default="no", choices=["yes", "no"],
+                        help="保留所有中间文件（默认 no，完成后删除工作目录）")
 
     args = parser.parse_args()
+
+    if args.aligner == "none":
+        args.align_model = None
 
     if args.chunk_seconds <= 0:
         raise ValueError("--chunk-seconds 必须大于 0")

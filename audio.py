@@ -17,7 +17,7 @@ def video_stem_paths(video_path: Path) -> Tuple[Path, Path]:
     """
     base = video_path.with_suffix("")
     full_wav = base.with_name(base.name + "_16k_mono.wav")
-    work_dir = base.with_name(base.name + "_srt_work")
+    work_dir = base.with_name(base.name + ".srt_work")
     return full_wav, work_dir
 
 
@@ -102,7 +102,7 @@ def split_audio_if_needed(
     把音频切成若干段，返回 [(chunk_index, chunk_path, chunk_start_offset), ...]。
 
     chunk wav 会保存在：
-      视频名._srt_work/chunk_0000.wav
+      视频名.srt_work/chunk_0000.wav
 
     已存在的 chunk wav 会复用；缺失的 chunk wav 会用 5 个 worker 并发生成。
     """

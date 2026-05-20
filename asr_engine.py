@@ -60,13 +60,25 @@ class QwenEngine(BaseASREngine):
 
 
 class ParakeetEngine(BaseASREngine):
-    """Parakeet models via parakeet-mlx. Built-in word-level alignment — no separate aligner needed."""
+    """Parakeet models via parakeet-mlx.
 
-    def __init__(self, model_path: str):
+    When *align_model_path* is provided, Parakeet is used only for
+    transcription and Qwen ForcedAligner handles timestamp alignment.
+    Otherwise Parakeet's built-in word-level timestamps are used.
+    """
+
+    def __init__(self, model_path: str, align_model_path: str | None = None):
         from parakeet_mlx import from_pretrained
 
         print(f"Loading Parakeet model: {model_path}")
         self._model = from_pretrained(model_path)
+        self._align_model = None
+
+        if align_model_path:
+            from mlx_audio.stt import load as mlx_load
+
+            print(f"Loading Qwen ForcedAligner for Parakeet: {align_model_path}")
+            self._align_model = mlx_load(align_model_path)
 
     @property
     def engine_type(self) -> ASREngineType:
@@ -81,6 +93,20 @@ class ParakeetEngine(BaseASREngine):
         result = self._model.transcribe(str(chunk_path))
 
         transcript = result.text or ""
+        if not transcript.strip():
+            return transcript, []
+
+        # Use Qwen ForcedAligner when available
+        if self._align_model is not None:
+            from asr import align_chunk, apply_transcript_punctuation_to_tokens
+
+            tokens = align_chunk(
+                self._align_model, chunk_path, transcript, language, offset=offset,
+            )
+            tokens = apply_transcript_punctuation_to_tokens(tokens, transcript)
+            return transcript, tokens
+
+        # Fallback: Parakeet built-in timestamps
         tokens: List[AlignToken] = []
         for tok in result.tokens:
             end = tok.end if tok.end > 0 else tok.start + tok.duration
@@ -117,6 +143,6 @@ def create_engine(
         if engine_type == ASREngineType.QWEN:
             return cls(asr_model_path, align_model_path)
         elif engine_type == ASREngineType.PARAKEET:
-            return cls(parakeet_model_path)
+            return cls(parakeet_model_path, align_model_path=align_model_path)
         else:
             raise ValueError(f"Unsupported engine: {engine_type}")
